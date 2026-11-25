@@ -12,18 +12,20 @@ static const struct value_name COLOR_PRESET[] = {
 };
 
 // Codes are from the VESA Monitor Control Command Set. A monitor supports only some of them.
+// Setup never writes to input or power: a monitor that changes input or switches off stops
+// answering, so the value could not be put back.
 static const struct control CONTROLS[] = {
-	{"brightness", 0x10, "Backlight brightness.", NULL},
-	{"contrast", 0x12, "Contrast.", NULL},
-	{"volume", 0x62, "Speaker or headphone volume.", NULL},
-	{"mute", 0x8D, "Sound mute: on or off.", MUTE},
-	{"red", 0x16, "Red gain.", NULL},
-	{"green", 0x18, "Green gain.", NULL},
-	{"blue", 0x1A, "Blue gain.", NULL},
-	{"color-preset", 0x14, "Colour temperature preset, such as 6500k or srgb.", COLOR_PRESET},
-	{"picture-mode", 0xDC, "Picture mode. The meaning of each number depends on the monitor.", NULL},
-	{"input", 0x60, "Input source. Some monitors report it and ignore changes.", INPUT},
-	{"power", 0xD6, "Power mode: on or off. Off needs --force.", POWER},
+	{"brightness", 0x10, "Backlight brightness.", NULL, PROBE_STEP},
+	{"contrast", 0x12, "Contrast.", NULL, PROBE_STEP},
+	{"volume", 0x62, "Speaker or headphone volume.", NULL, PROBE_STEP},
+	{"mute", 0x8D, "Sound mute: on or off.", MUTE, PROBE_TOGGLE},
+	{"red", 0x16, "Red gain.", NULL, PROBE_STEP},
+	{"green", 0x18, "Green gain.", NULL, PROBE_STEP},
+	{"blue", 0x1A, "Blue gain.", NULL, PROBE_STEP},
+	{"color-preset", 0x14, "Colour temperature preset, such as 6500k or srgb.", COLOR_PRESET, PROBE_WATCH},
+	{"picture-mode", 0xDC, "Picture mode. The meaning of each number depends on the monitor.", NULL, PROBE_WATCH},
+	{"input", 0x60, "Input source. Some monitors report it and ignore changes.", INPUT, PROBE_NONE},
+	{"power", 0xD6, "Power mode: on or off. Off needs --force.", POWER, PROBE_NONE},
 };
 #define COUNT (sizeof CONTROLS / sizeof CONTROLS[0])
 

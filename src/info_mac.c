@@ -1,5 +1,6 @@
-// Reads what macOS already knows about the external display: its model name, its current
-// resolution, and the firmware version of its Thunderbolt controller.
+// Reads what macOS already knows about the external display: its model name, its manufacturer
+// and product numbers, when it was built, its current resolution, and the firmware version of
+// its Thunderbolt controller.
 // Nothing here talks to the monitor. The resolution comes from the public CoreGraphics interface,
 // and the other two come from the IORegistry, the same place System Information reads them.
 #include "info_mac.h"
@@ -22,6 +23,14 @@ static int number_is(CFDictionaryRef dictionary, CFStringRef key, long long expe
 	return CFNumberGetValue(value, kCFNumberLongLongType, &number) && number == expected;
 }
 
+// A whole number from a dictionary, or 0 when it is missing or negative.
+static unsigned number_in(CFDictionaryRef dictionary, CFStringRef key) {
+	CFTypeRef value = CFDictionaryGetValue(dictionary, key);
+	long long number;
+	if (!value || CFGetTypeID(value) != CFNumberGetTypeID()) return 0;
+	return CFNumberGetValue(value, kCFNumberLongLongType, &number) && number > 0 ? (unsigned)number : 0;
+}
+
 static int number_property(io_service_t service, CFStringRef key, long long *number) {
 	CFTypeRef value = IORegistryEntryCreateCFProperty(service, key, kCFAllocatorDefault, 0);
 	int ok = value && CFGetTypeID(value) == CFNumberGetTypeID() && CFNumberGetValue(value, kCFNumberLongLongType, number);
@@ -30,8 +39,12 @@ static int number_property(io_service_t service, CFStringRef key, long long *num
 }
 
 // Each display's registry entry carries the vendor and product numbers from its EDID next to the
-// product name. CoreGraphics reports the same two numbers, so they pick out the right entry.
-static void read_model(uint32_t vendor, uint32_t product, char *model, size_t size) {
+// product name and the build date. CoreGraphics reports the same two numbers, so they pick out
+// the right entry. The entry also holds serial numbers, which are never read.
+static void read_product(struct display_info *info) {
+	char *model = info->model;
+	size_t size = sizeof info->model;
+	uint32_t vendor = info->vendor, product = info->product;
 	io_iterator_t iterator;
 	if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOMobileFramebufferShim"), &iterator) != KERN_SUCCESS) return;
 	io_service_t service;
@@ -42,6 +55,8 @@ static void read_model(uint32_t vendor, uint32_t product, char *model, size_t si
 			if (details && number_is(details, CFSTR("LegacyManufacturerID"), vendor) && number_is(details, CFSTR("ProductID"), product)) {
 				CFTypeRef name = CFDictionaryGetValue(details, CFSTR("ProductName"));
 				if (name && CFGetTypeID(name) == CFStringGetTypeID() && !CFStringGetCString(name, model, (CFIndex)size, kCFStringEncodingUTF8)) model[0] = '\0';
+				info->year = number_in(details, CFSTR("YearOfManufacture"));
+				info->week = number_in(details, CFSTR("WeekOfManufacture"));
 			}
 		}
 		if (attributes) CFRelease(attributes);
@@ -92,7 +107,9 @@ int info_mac_read(void *ctx, struct display_info *info) {
 		CGDisplayModeRelease(mode);
 	}
 
-	read_model(CGDisplayVendorNumber(display), CGDisplayModelNumber(display), info->model, sizeof info->model);
+	info->vendor = CGDisplayVendorNumber(display);
+	info->product = CGDisplayModelNumber(display);
+	read_product(info);
 	read_thunderbolt(info->model, info->thunderbolt, sizeof info->thunderbolt);
 	return 0;
 }

@@ -7,7 +7,7 @@
 
 #include "controls.h"
 
-enum verb { VERB_HELP, VERB_LIST, VERB_GET, VERB_SET, VERB_CHG, VERB_CAPS, VERB_SCAN, VERB_INFO, VERB_TIMING };
+enum verb { VERB_HELP, VERB_LIST, VERB_GET, VERB_SET, VERB_CHG, VERB_CAPS, VERB_SCAN, VERB_INFO, VERB_TIMING, VERB_SETUP };
 
 struct command {
 	enum verb verb;

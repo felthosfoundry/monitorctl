@@ -16,6 +16,9 @@ struct display_info {
 	double refresh;         // the refresh rate in Hz, or 0 when unknown
 	char thunderbolt[32];   // the firmware version of the monitor's Thunderbolt controller,
 	                        // or "" when the monitor is not connected over Thunderbolt
+	unsigned vendor;        // the manufacturer number from the display's EDID, or 0 when unknown
+	unsigned product;       // the product number from the display's EDID
+	unsigned year, week;    // when the display was built, or 0 when unknown
 };
 
 struct transport {
@@ -25,6 +28,8 @@ struct transport {
 	int (*read)(void *ctx, uint8_t *buffer, size_t n);
 	void (*pause)(void *ctx, unsigned milliseconds);
 	int (*info)(void *ctx, struct display_info *info);
+	// Stores a profile's text under the monitor's identifier and writes where it went to `path`.
+	int (*save)(void *ctx, const char *id, const char *text, char *path, size_t size);
 };
 
 // Exit codes.

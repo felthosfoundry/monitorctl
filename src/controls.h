@@ -10,11 +10,20 @@ struct value_name {
 	const char *name; // NULL marks the end of a list
 };
 
+// How `monitorctl setup` treats a control. Setup writes only to the controls marked here.
+enum probe {
+	PROBE_NONE,   // never written by setup
+	PROBE_WATCH,  // not tested, and put back if a test changed it as a side effect
+	PROBE_STEP,   // tested by moving it one step, then put back
+	PROBE_TOGGLE, // tested by switching between its two values, 1 and 2, then put back
+};
+
 struct control {
 	const char *name;
 	uint8_t code;
 	const char *help;
 	const struct value_name *names; // NULL when the control is a plain number
+	enum probe probe;
 };
 
 // Every named control, in the order `monitorctl list` prints them.

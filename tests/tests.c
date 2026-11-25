@@ -4,10 +4,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "../src/cli.h"
 #include "../src/controls.h"
 #include "../src/ddc.h"
+#include "../src/profile.h"
 #include "../src/run.h"
 
 static int checks, failures;
@@ -43,6 +46,8 @@ struct setting {
 	uint8_t code;
 	uint16_t current, maximum;
 	int ignores_writes;
+	int write_limit; // when above 0, the setting accepts this many writes and ignores the rest
+	int writes;      // how many writes it has accepted
 };
 
 struct fake {
@@ -58,6 +63,14 @@ struct fake {
 	int info_fails;                  // the computer cannot describe the display
 	struct timing timing;            // what the monitor reports about its signal
 	int no_timing;                   // the monitor does not answer timing requests
+	int no_caps;                     // the monitor does not answer capability requests
+	int wrote[256];                  // how many set requests arrived for each code
+	int volume_unmutes;              // like the Samsung: a volume write switches mute off
+	int gain_sets_preset;            // a colour gain write switches the colour preset to user1
+	char saved_id[16];               // the name the last profile was saved under
+	char saved[16384];               // the text of the last saved profile
+	int saves;                       // how many profiles were saved
+	int save_fails;                  // the computer cannot save a profile
 };
 
 static struct setting *fake_find(struct fake *f, uint8_t code) {
@@ -82,8 +95,15 @@ static int fake_write(void *ctx, const uint8_t *packet, size_t n) {
 	memcpy(f->pending, packet, n);
 	if (packet[1] == 0x03) {
 		f->sets++;
+		f->wrote[packet[2]]++;
 		struct setting *s = fake_find(f, packet[2]);
-		if (s && !s->ignores_writes) s->current = (uint16_t)(packet[3] << 8 | packet[4]);
+		if (s && !s->ignores_writes && (s->write_limit == 0 || s->writes < s->write_limit)) {
+			s->current = (uint16_t)(packet[3] << 8 | packet[4]);
+			s->writes++;
+			struct setting *mute = fake_find(f, 0x8D), *preset = fake_find(f, 0x14);
+			if (f->volume_unmutes && packet[2] == 0x62 && mute) mute->current = 2;
+			if (f->gain_sets_preset && packet[2] == 0x16 && preset) preset->current = 11;
+		}
 		// Like the real monitor: once switched off, it stops listening.
 		if (packet[2] == 0xD6 && s && s->current != 1) f->unreachable = 1;
 	}
@@ -115,7 +135,7 @@ static int fake_read(void *ctx, uint8_t *buffer, size_t n) {
 			(uint8_t)(f->timing.vertical >> 8), (uint8_t)(f->timing.vertical & 0xFF), 0};
 		reply[8] = reply_checksum(reply, 8);
 		memcpy(buffer, reply, n < sizeof reply ? n : sizeof reply);
-	} else if (f->pending[1] == 0xF3) {
+	} else if (f->pending[1] == 0xF3 && !f->no_caps) {
 		uint16_t offset = (uint16_t)(f->pending[2] << 8 | f->pending[3]);
 		size_t total = strlen(f->caps);
 		size_t len = offset >= total ? 0 : total - offset;
@@ -140,21 +160,32 @@ static int fake_info(void *ctx, struct display_info *info) {
 	return 0;
 }
 
+static int fake_save(void *ctx, const char *id, const char *text, char *path, size_t size) {
+	struct fake *f = ctx;
+	if (f->save_fails) return -1;
+	f->saves++;
+	snprintf(f->saved_id, sizeof f->saved_id, "%s", id);
+	snprintf(f->saved, sizeof f->saved, "%s", text);
+	snprintf(path, size, "/profiles/%s.txt", id);
+	return 0;
+}
+
 static struct fake samsung(void) {
 	struct fake f = {
 		.settings = {
-			{0x10, 95, 100, 0},  // brightness
-			{0x12, 75, 100, 0},  // contrast
-			{0x62, 50, 100, 0},  // volume
-			{0x8D, 2, 2, 0},     // mute, off
-			{0x14, 4, 11, 0},    // colour preset
-			{0x60, 4, 3, 1},     // input: this monitor ignores writes to it
-			{0xD6, 1, 4, 0},     // power
-			{0xB6, 3, 0, 0},     // a code that reports a maximum of 0
+			{.code = 0x10, .current = 95, .maximum = 100}, // brightness
+			{.code = 0x12, .current = 75, .maximum = 100}, // contrast
+			{.code = 0x62, .current = 50, .maximum = 100}, // volume
+			{.code = 0x8D, .current = 2, .maximum = 2},    // mute, off
+			{.code = 0x14, .current = 4, .maximum = 11},   // colour preset
+			{.code = 0x60, .current = 4, .maximum = 3, .ignores_writes = 1}, // input: this monitor ignores writes to it
+			{.code = 0xD6, .current = 1, .maximum = 4},    // power
+			{.code = 0xB6, .current = 3, .maximum = 0},    // a code that reports a maximum of 0
 		},
 		.count = 8,
 		.caps = "(prot(monitor)type(lcd)model(FALCON)cmds(01 02 03)vcp(10 12 14(01 04 05) 60(01 03) 62 8D))",
-		.info = {.model = "C34J79x", .width = 3440, .height = 1440, .refresh = 100.0, .thunderbolt = "61.2"},
+		.info = {.model = "C34J79x", .width = 3440, .height = 1440, .refresh = 100.0, .thunderbolt = "61.2",
+			.vendor = 19501, .product = 3870, .year = 2022, .week = 44},
 		.timing = {.status = 0x03, .horizontal = 15090, .vertical = 10040},
 	};
 	return f;
@@ -181,7 +212,7 @@ static int run(struct fake *f, const char *line) {
 	size_t out_size = 0, err_size = 0;
 	FILE *out = open_memstream(&out_buffer, &out_size);
 	FILE *err = open_memstream(&err_buffer, &err_size);
-	struct transport t = {f, fake_write, fake_read, fake_pause, fake_info};
+	struct transport t = {f, fake_write, fake_read, fake_pause, fake_info, fake_save};
 	int code = run_command(&cmd, &t, out, err);
 	fclose(out);
 	fclose(err);
@@ -404,6 +435,9 @@ static void test_cli(void) {
 	CHECK(parse("timing", &c, err, sizeof err) == 0 && c.verb == VERB_TIMING);
 	CHECK(parse("timing extra", &c, err, sizeof err) == -1);
 	CHECK_STR(err, "Too many arguments for timing.");
+	CHECK(parse("setup", &c, err, sizeof err) == 0 && c.verb == VERB_SETUP);
+	CHECK(parse("setup extra", &c, err, sizeof err) == -1);
+	CHECK_STR(err, "Too many arguments for setup.");
 
 	CHECK(parse("get brightness", &c, err, sizeof err) == 0);
 	CHECK(c.verb == VERB_GET && c.code == 0x10 && c.control == control_find("brightness") && !c.force);
@@ -447,6 +481,7 @@ static void test_cli(void) {
 	CHECK_HAS(cli_usage(), "--force");
 	CHECK_HAS(cli_usage(), "monitorctl info");
 	CHECK_HAS(cli_usage(), "monitorctl timing");
+	CHECK_HAS(cli_usage(), "monitorctl setup");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -752,6 +787,324 @@ static void test_timing_retries_and_failure(void) {
 	CHECK_HAS(err_text, "did not answer the timing request");
 }
 
+// ---------------------------------------------------------------------------------------------
+// Profiles
+
+static void test_profile_id(void) {
+	char id[8];
+	// The three letters are packed five bits each into the manufacturer number.
+	CHECK(profile_id(19501, 3870, id) == 0);
+	CHECK_STR(id, "SAM0F1E");
+	CHECK(profile_id(4268, 0xA0B8, id) == 0);
+	CHECK_STR(id, "DELA0B8");
+	CHECK(profile_id(19501, 0, id) == 0);
+	CHECK_STR(id, "SAM0000");
+
+	// A number that does not decode to three letters is not a manufacturer.
+	CHECK(profile_id(0, 3870, id) == -1);
+	CHECK(profile_id(27 << 10 | 1 << 5 | 1, 1, id) == -1);
+	CHECK(profile_id(0x8000 | 19501, 3870, id) == -1);
+	CHECK(profile_id(19501, 0x10000, id) == -1);
+}
+
+static void test_profile_format(void) {
+	struct profile p = {
+		.id = "SAM0F1E",
+		.model = "C34J79x",
+		.year = 2022,
+		.week = 44,
+		.thunderbolt = "61.2",
+		.caps = "(prot(monitor)vcp(10 60))",
+		.codes = {{0x10, 100, WRITE_WORKS}, {0x60, 3, WRITE_UNTESTED}, {0xDC, 3, WRITE_IGNORED}},
+		.count = 3,
+	};
+	char text[1024];
+	CHECK(profile_format(&p, text, sizeof text) == (int)strlen(text));
+	CHECK_STR(text,
+		"monitorctl-profile 1\n"
+		"id SAM0F1E\n"
+		"model C34J79x\n"
+		"built 2022 week 44\n"
+		"thunderbolt 61.2\n"
+		"caps (prot(monitor)vcp(10 60))\n"
+		"code 0x10 max 100 write works\n"
+		"code 0x60 max 3 write untested\n"
+		"code 0xDC max 3 write ignored\n");
+
+	// Facts that are not known are left out.
+	struct profile bare = {.id = "DELA0B8", .year = 2019, .codes = {{0x10, 100, WRITE_UNTESTED}}, .count = 1};
+	CHECK(profile_format(&bare, text, sizeof text) > 0);
+	CHECK_STR(text, "monitorctl-profile 1\nid DELA0B8\nbuilt 2019\ncode 0x10 max 100 write untested\n");
+
+	// Text from the monitor cannot start a new line in the file.
+	struct profile odd = {.id = "SAM0F1E", .model = "Odd\nid FAKE\tname", .caps = "(a)\r\ncode 0x60 max 3 write works"};
+	CHECK(profile_format(&odd, text, sizeof text) > 0);
+	CHECK_STR(text, "monitorctl-profile 1\nid SAM0F1E\nmodel Odd id FAKE name\ncaps (a)  code 0x60 max 3 write works\n");
+
+	char small[40];
+	CHECK(profile_format(&p, small, sizeof small) == -1);
+}
+
+static void read_file(const char *path, char *text, size_t size) {
+	text[0] = '\0';
+	FILE *file = fopen(path, "r");
+	if (!file) return;
+	size_t n = fread(text, 1, size - 1, file);
+	text[n] = '\0';
+	fclose(file);
+}
+
+static void test_profile_save(void) {
+	char root[512], path[1024], expected[1024], text[256];
+	const char *tmp = getenv("TMPDIR");
+	snprintf(root, sizeof root, "%s/monitorctl-tests-XXXXXX", tmp && tmp[0] ? tmp : "/tmp");
+	CHECK(mkdtemp(root) != NULL);
+
+	// With XDG_CONFIG_HOME set, the profile goes in a monitorctl folder there.
+	setenv("XDG_CONFIG_HOME", root, 1);
+	CHECK(profile_save(NULL, "SAM0F1E", "first\n", path, sizeof path) == 0);
+	snprintf(expected, sizeof expected, "%s/monitorctl/SAM0F1E.txt", root);
+	CHECK_STR(path, expected);
+	read_file(path, text, sizeof text);
+	CHECK_STR(text, "first\n");
+
+	// Saving again replaces the file.
+	CHECK(profile_save(NULL, "SAM0F1E", "second\n", path, sizeof path) == 0);
+	read_file(path, text, sizeof text);
+	CHECK_STR(text, "second\n");
+	unlink(path);
+
+	// A name that could leave the folder is refused.
+	CHECK(profile_save(NULL, "../evil", "x\n", path, sizeof path) == -1);
+	CHECK(profile_save(NULL, "", "x\n", path, sizeof path) == -1);
+
+	// Without XDG_CONFIG_HOME, the folder is .config/monitorctl in the home folder.
+	unsetenv("XDG_CONFIG_HOME");
+	char *old_home = getenv("HOME");
+	char saved_home[512];
+	snprintf(saved_home, sizeof saved_home, "%s", old_home ? old_home : "");
+	setenv("HOME", root, 1);
+	CHECK(profile_save(NULL, "DELA0B8", "third\n", path, sizeof path) == 0);
+	snprintf(expected, sizeof expected, "%s/.config/monitorctl/DELA0B8.txt", root);
+	CHECK_STR(path, expected);
+	read_file(path, text, sizeof text);
+	CHECK_STR(text, "third\n");
+	unlink(path);
+
+	// A folder that cannot be made is a failure, not a crash.
+	char blocker[1024];
+	snprintf(blocker, sizeof blocker, "%s/blocker", root);
+	FILE *file = fopen(blocker, "w");
+	CHECK(file != NULL);
+	if (file) fclose(file);
+	setenv("XDG_CONFIG_HOME", blocker, 1);
+	CHECK(profile_save(NULL, "SAM0F1E", "x\n", path, sizeof path) == -1);
+	unlink(blocker);
+
+	unsetenv("XDG_CONFIG_HOME");
+	if (saved_home[0]) setenv("HOME", saved_home, 1);
+	char folder[1024];
+	snprintf(folder, sizeof folder, "%s/monitorctl", root);
+	rmdir(folder);
+	snprintf(folder, sizeof folder, "%s/.config/monitorctl", root);
+	rmdir(folder);
+	snprintf(folder, sizeof folder, "%s/.config", root);
+	rmdir(folder);
+	CHECK(rmdir(root) == 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Setup
+
+static int total_writes_outside(const struct fake *f, const uint8_t *allowed, size_t count) {
+	int total = 0;
+	for (int code = 0; code < 256; code++) {
+		int ok = 0;
+		for (size_t i = 0; i < count; i++) ok |= allowed[i] == code;
+		if (!ok) total += f->wrote[code];
+	}
+	return total;
+}
+
+static void test_setup(void) {
+	struct fake f = samsung();
+	CHECK(run(&f, "setup") == EXIT_OK);
+	CHECK_STR(err_text, "");
+	CHECK(f.bad_packets == 0);
+
+	// The profile is saved under the monitor's identifier, with every code it supports.
+	CHECK(f.saves == 1);
+	CHECK_STR(f.saved_id, "SAM0F1E");
+	char expected[1024];
+	snprintf(expected, sizeof expected,
+		"monitorctl-profile 1\n"
+		"id SAM0F1E\n"
+		"model C34J79x\n"
+		"built 2022 week 44\n"
+		"thunderbolt 61.2\n"
+		"caps %s\n"
+		"code 0x10 max 100 write works\n"
+		"code 0x12 max 100 write works\n"
+		"code 0x14 max 11 write untested\n"
+		"code 0x60 max 3 write untested\n"
+		"code 0x62 max 100 write works\n"
+		"code 0x8D max 2 write works\n"
+		"code 0xB6 max 0 write untested\n"
+		"code 0xD6 max 4 write untested\n",
+		f.caps);
+	CHECK_STR(f.saved, expected);
+
+	// Each tested control moved by one step and was put back, and nothing else was written.
+	CHECK(f.wrote[0x10] == 2 && f.wrote[0x12] == 2 && f.wrote[0x62] == 2 && f.wrote[0x8D] == 2);
+	CHECK(f.sets == 8);
+	CHECK(fake_find(&f, 0x10)->current == 95);
+	CHECK(fake_find(&f, 0x12)->current == 75);
+	CHECK(fake_find(&f, 0x62)->current == 50);
+	CHECK(fake_find(&f, 0x8D)->current == 2);
+	CHECK(fake_find(&f, 0x14)->current == 4);
+	CHECK(fake_find(&f, 0x60)->current == 4);
+	CHECK(fake_find(&f, 0xD6)->current == 1);
+
+	CHECK_HAS(out_text, "The picture may flicker");
+	CHECK_HAS(out_text, "monitor        C34J79x (SAM0F1E)\n");
+	CHECK_HAS(out_text, "codes          8 can be read\n");
+	CHECK_HAS(out_text, "brightness     writes work\n");
+	CHECK_HAS(out_text, "mute           writes work\n");
+	CHECK_HAS(out_text, "red            not supported\n");
+	CHECK_HAS(out_text, "color-preset   writes not tested\n");
+	CHECK_HAS(out_text, "input          writes not tested\n");
+	CHECK_HAS(out_text, "power          writes not tested\n");
+	CHECK_HAS(out_text, "profile        /profiles/SAM0F1E.txt\n");
+}
+
+static void test_setup_never_writes_risky_codes(void) {
+	// A monitor that supports every kind of code setup must leave alone.
+	struct fake f = samsung();
+	f.settings[f.count++] = (struct setting){.code = 0x04, .current = 0, .maximum = 1};  // restore factory defaults
+	f.settings[f.count++] = (struct setting){.code = 0xDC, .current = 2, .maximum = 3};  // picture mode
+	f.settings[f.count++] = (struct setting){.code = 0xE2, .current = 0, .maximum = 2};  // manufacturer-private
+	f.settings[f.count++] = (struct setting){.code = 0xFE, .current = 1, .maximum = 2};  // manufacturer-private
+	CHECK(run(&f, "setup") == EXIT_OK);
+	static const uint8_t tested[] = {0x10, 0x12, 0x62, 0x8D, 0x16, 0x18, 0x1A};
+	CHECK(total_writes_outside(&f, tested, sizeof tested) == 0);
+	CHECK_HAS(f.saved, "code 0x04 max 1 write untested\n");
+	CHECK_HAS(f.saved, "code 0xDC max 3 write untested\n");
+	CHECK_HAS(f.saved, "code 0xE2 max 2 write untested\n");
+}
+
+static void test_setup_when_the_monitor_ignores_a_write(void) {
+	struct fake f = samsung();
+	fake_find(&f, 0x10)->ignores_writes = 1;
+	CHECK(run(&f, "setup") == EXIT_OK);
+	CHECK_STR(err_text, "");
+	CHECK_HAS(f.saved, "code 0x10 max 100 write ignored\n");
+	CHECK_HAS(f.saved, "code 0x12 max 100 write works\n");
+	CHECK_HAS(out_text, "brightness     writes are ignored\n");
+	// The value never moved, so there was nothing to put back.
+	CHECK(f.wrote[0x10] == 1);
+}
+
+static void test_setup_steps_down_from_the_top(void) {
+	struct fake f = samsung();
+	fake_find(&f, 0x10)->current = 100;
+	fake_find(&f, 0x62)->current = 0;
+	fake_find(&f, 0x8D)->current = 1;
+	CHECK(run(&f, "setup") == EXIT_OK);
+	CHECK_HAS(f.saved, "code 0x10 max 100 write works\n");
+	CHECK_HAS(f.saved, "code 0x62 max 100 write works\n");
+	CHECK_HAS(f.saved, "code 0x8D max 2 write works\n");
+	CHECK(fake_find(&f, 0x10)->current == 100);
+	CHECK(fake_find(&f, 0x62)->current == 0);
+	CHECK(fake_find(&f, 0x8D)->current == 1);
+
+	// A mute value that is neither on nor off is left alone.
+	struct fake odd = samsung();
+	fake_find(&odd, 0x8D)->current = 0;
+	CHECK(run(&odd, "setup") == EXIT_OK);
+	CHECK(odd.wrote[0x8D] == 0);
+	CHECK_HAS(odd.saved, "code 0x8D max 2 write untested\n");
+}
+
+static void test_setup_puts_back_side_effects(void) {
+	// On the Samsung, changing the volume switches mute off.
+	struct fake f = samsung();
+	f.volume_unmutes = 1;
+	fake_find(&f, 0x8D)->current = 1;
+	CHECK(run(&f, "setup") == EXIT_OK);
+	CHECK_STR(err_text, "");
+	CHECK(fake_find(&f, 0x8D)->current == 1);
+	CHECK(fake_find(&f, 0x62)->current == 50);
+
+	// On some monitors, changing a colour gain switches the colour preset.
+	struct fake g = samsung();
+	g.gain_sets_preset = 1;
+	g.settings[g.count++] = (struct setting){.code = 0x16, .current = 70, .maximum = 100};
+	CHECK(run(&g, "setup") == EXIT_OK);
+	CHECK_STR(err_text, "");
+	CHECK_HAS(g.saved, "code 0x16 max 100 write works\n");
+	CHECK(fake_find(&g, 0x16)->current == 70);
+	CHECK(fake_find(&g, 0x14)->current == 4);
+	// The preset was written once, to put it back. Its own writes were not tested.
+	CHECK(g.wrote[0x14] == 1);
+	CHECK_HAS(g.saved, "code 0x14 max 11 write untested\n");
+}
+
+static void test_setup_when_a_setting_cannot_be_put_back(void) {
+	struct fake f = samsung();
+	fake_find(&f, 0x10)->write_limit = 1; // accepts the test write, then ignores the rest
+	CHECK(run(&f, "setup") == EXIT_NOT_APPLIED);
+	CHECK_HAS(err_text, "Could not put brightness back to 95. It is now 96.");
+	// The profile is still saved.
+	CHECK(f.saves == 1);
+	CHECK_HAS(f.saved, "code 0x10 max 100 write works\n");
+	CHECK_HAS(out_text, "profile        /profiles/SAM0F1E.txt\n");
+}
+
+static void test_setup_failures(void) {
+	struct fake off = samsung();
+	off.unreachable = 1;
+	CHECK(run(&off, "setup") == EXIT_FAILED);
+	CHECK_HAS(err_text, "did not answer");
+	CHECK(off.saves == 0);
+
+	// Without the manufacturer and product numbers there is no name to save under.
+	struct fake unknown = samsung();
+	unknown.info.vendor = 0;
+	CHECK(run(&unknown, "setup") == EXIT_FAILED);
+	CHECK_HAS(err_text, "could not identify the display");
+	CHECK(unknown.sets == 0 && unknown.saves == 0);
+
+	struct fake blind = samsung();
+	blind.info_fails = 1;
+	CHECK(run(&blind, "setup") == EXIT_FAILED);
+	CHECK_HAS(err_text, "could not identify the display");
+	CHECK(blind.sets == 0);
+
+	// When the profile cannot be saved, the settings are still put back.
+	struct fake full = samsung();
+	full.save_fails = 1;
+	CHECK(run(&full, "setup") == EXIT_FAILED);
+	CHECK_HAS(err_text, "The profile could not be saved");
+	CHECK(fake_find(&full, 0x10)->current == 95);
+	CHECK(fake_find(&full, 0x8D)->current == 2);
+}
+
+static void test_setup_with_facts_missing(void) {
+	// A monitor that does not answer capability requests, on a cable that is not Thunderbolt.
+	struct fake f = samsung();
+	f.no_caps = 1;
+	f.info.thunderbolt[0] = '\0';
+	f.info.model[0] = '\0';
+	f.info.year = f.info.week = 0;
+	CHECK(run(&f, "setup") == EXIT_OK);
+	CHECK(strstr(f.saved, "caps ") == NULL);
+	CHECK(strstr(f.saved, "thunderbolt ") == NULL);
+	CHECK(strstr(f.saved, "model ") == NULL);
+	CHECK(strstr(f.saved, "built ") == NULL);
+	CHECK_HAS(f.saved, "monitorctl-profile 1\nid SAM0F1E\ncode 0x10 max 100 write works\n");
+	CHECK_HAS(out_text, "monitor        unknown model (SAM0F1E)\n");
+}
+
 static void test_help(void) {
 	struct fake f = samsung();
 	CHECK(run(&f, "help") == EXIT_OK);
@@ -785,6 +1138,17 @@ int main(void) {
 	test_timing();
 	test_timing_flags();
 	test_timing_retries_and_failure();
+	test_profile_id();
+	test_profile_format();
+	test_profile_save();
+	test_setup();
+	test_setup_never_writes_risky_codes();
+	test_setup_when_the_monitor_ignores_a_write();
+	test_setup_steps_down_from_the_top();
+	test_setup_puts_back_side_effects();
+	test_setup_when_a_setting_cannot_be_put_back();
+	test_setup_failures();
+	test_setup_with_facts_missing();
 	test_help();
 	printf("%d checks, %d failed\n", checks, failures);
 	return failures == 0 ? 0 : 1;

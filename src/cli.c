@@ -16,6 +16,7 @@ const char *cli_usage(void) {
 	       "  monitorctl info                     show the model, resolution, Thunderbolt firmware\n"
 	       "                                      and capability string\n"
 	       "  monitorctl timing                   show the signal the monitor says it is receiving\n"
+	       "  monitorctl setup                    test what the monitor supports and save a profile\n"
 	       "  monitorctl help                     show this text\n"
 	       "\n"
 	       "A control is a name from 'monitorctl list', or a raw code such as 0x10.\n"
@@ -105,7 +106,7 @@ int cli_parse(int argc, char **argv, struct command *cmd, char *err, size_t errl
 	static const struct {
 		const char *name;
 		enum verb verb;
-	} plain[] = {{"list", VERB_LIST}, {"caps", VERB_CAPS}, {"scan", VERB_SCAN}, {"info", VERB_INFO}, {"timing", VERB_TIMING}};
+	} plain[] = {{"list", VERB_LIST}, {"caps", VERB_CAPS}, {"scan", VERB_SCAN}, {"info", VERB_INFO}, {"timing", VERB_TIMING}, {"setup", VERB_SETUP}};
 	for (size_t i = 0; i < sizeof plain / sizeof plain[0]; i++) {
 		if (strcmp(verb, plain[i].name) != 0) continue;
 		if (n > 1) {
