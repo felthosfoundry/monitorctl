@@ -4,7 +4,8 @@
 #include "transport_mac.h"
 
 #include "info_mac.h"
-#include "lookup_curl.h"
+#include "ask_tty.h"
+#include "database_curl.h"
 #include "profile.h"
 
 #include <CoreFoundation/CoreFoundation.h>
@@ -60,6 +61,8 @@ int transport_mac_open(struct transport *t) {
 	t->pause = mac_pause;
 	t->info = info_mac_read;
 	t->save = profile_save;
-	t->lookup = lookup_curl;
+	t->lookup = database_lookup;
+	t->ask = ask_tty;
+	t->upload = database_upload;
 	return 0;
 }

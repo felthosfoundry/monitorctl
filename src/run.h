@@ -33,6 +33,13 @@ struct transport {
 	// Asks the monitor database for the record of the monitor `id`. Returns 0 with the record in
 	// `text`, 1 when the database has no reports for it, and -1 when it could not be reached.
 	int (*lookup)(void *ctx, const char *id, char *text, size_t size);
+	// Asks the person at the keyboard a yes-or-no question. Returns 1 for yes, 0 for no, and -1
+	// when there is nobody to ask, because the program is not running in a terminal.
+	int (*ask)(void *ctx, const char *question);
+	// Sends a profile to the monitor database. Returns 0 when the database took it, 1 when it
+	// already had this report, -2 when it refused the profile, and -1 when it could not be
+	// reached or is not taking reports.
+	int (*upload)(void *ctx, const char *text);
 };
 
 // Exit codes.

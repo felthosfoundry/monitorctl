@@ -75,6 +75,12 @@ struct fake {
 	int db_unreachable;              // the monitor database cannot be reached
 	int lookups;                     // how many times the database was asked
 	char lookup_id[16];              // the identifier the database was last asked about
+	int answer;                      // what the person says when asked: 1 yes, 0 no, -1 nobody there
+	int asks;                        // how many questions were asked
+	char asked[512];                 // the last question
+	int upload_result;               // what the database says to an upload
+	int uploads;                     // how many profiles were sent
+	char uploaded[16384];            // the last profile sent
 };
 
 static struct setting *fake_find(struct fake *f, uint8_t code) {
@@ -184,6 +190,20 @@ static int fake_lookup(void *ctx, const char *id, char *text, size_t size) {
 	return 0;
 }
 
+static int fake_ask(void *ctx, const char *question) {
+	struct fake *f = ctx;
+	f->asks++;
+	snprintf(f->asked, sizeof f->asked, "%s", question);
+	return f->answer;
+}
+
+static int fake_upload(void *ctx, const char *text) {
+	struct fake *f = ctx;
+	f->uploads++;
+	snprintf(f->uploaded, sizeof f->uploaded, "%s", text);
+	return f->upload_result;
+}
+
 static struct fake samsung(void) {
 	struct fake f = {
 		.settings = {
@@ -226,7 +246,7 @@ static int run(struct fake *f, const char *line) {
 	size_t out_size = 0, err_size = 0;
 	FILE *out = open_memstream(&out_buffer, &out_size);
 	FILE *err = open_memstream(&err_buffer, &err_size);
-	struct transport t = {f, fake_write, fake_read, fake_pause, fake_info, fake_save, fake_lookup};
+	struct transport t = {f, fake_write, fake_read, fake_pause, fake_info, fake_save, fake_lookup, fake_ask, fake_upload};
 	int code = run_command(&cmd, &t, out, err);
 	fclose(out);
 	fclose(err);
@@ -457,6 +477,12 @@ static void test_cli(void) {
 	CHECK(parse("--offline setup", &c, err, sizeof err) == 0 && c.offline);
 	CHECK(parse("list --offline", &c, err, sizeof err) == -1);
 	CHECK_STR(err, "--offline only applies to setup.");
+	CHECK(parse("setup", &c, err, sizeof err) == 0 && !c.upload);
+	CHECK(parse("setup --upload", &c, err, sizeof err) == 0 && c.verb == VERB_SETUP && c.upload && !c.offline);
+	CHECK(parse("list --upload", &c, err, sizeof err) == -1);
+	CHECK_STR(err, "--upload only applies to setup.");
+	CHECK(parse("setup --upload --offline", &c, err, sizeof err) == -1);
+	CHECK_STR(err, "--upload and --offline cannot be used together.");
 
 	CHECK(parse("get brightness", &c, err, sizeof err) == 0);
 	CHECK(c.verb == VERB_GET && c.code == 0x10 && c.control == control_find("brightness") && !c.force);
@@ -502,6 +528,7 @@ static void test_cli(void) {
 	CHECK_HAS(cli_usage(), "monitorctl timing");
 	CHECK_HAS(cli_usage(), "monitorctl setup");
 	CHECK_HAS(cli_usage(), "--offline");
+	CHECK_HAS(cli_usage(), "--upload");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1251,7 +1278,7 @@ static void test_setup_when_the_database_has_nothing_to_say(void) {
 	struct fake none = samsung();
 	CHECK(run(&none, "setup") == EXIT_OK);
 	CHECK(none.lookups == 1);
-	CHECK_HAS(out_text, "database       no reports for this monitor yet. To add yours, see https://felthosfoundry.com/monitorctl/\n");
+	CHECK_HAS(out_text, "database       no reports for this monitor yet. Yours would be the first.\n");
 	CHECK_HAS(out_text, "input          writes not tested\n");
 
 	// A database that cannot be reached is not an error.
@@ -1305,6 +1332,101 @@ static void test_setup_database_cannot_cause_a_write(void) {
 	CHECK(unknown.lookups == 0);
 }
 
+static void test_setup_asks_before_sending(void) {
+	// The person says no, which is also what an empty answer means.
+	struct fake no = samsung();
+	CHECK(run(&no, "setup") == EXIT_OK);
+	CHECK(no.asks == 1);
+	CHECK(no.uploads == 0);
+	CHECK_HAS(no.asked, "felthosfoundry.com");
+	CHECK_HAS(no.asked, "no serial number");
+	CHECK_HAS(no.asked, "[y/N]");
+	CHECK(strstr(out_text, "sent ") == NULL);
+
+	// The person says yes. What is sent is the saved profile, byte for byte.
+	struct fake yes = samsung();
+	yes.answer = 1;
+	yes.db_record = DATABASE;
+	CHECK(run(&yes, "setup") == EXIT_OK);
+	CHECK_STR(err_text, "");
+	CHECK(yes.asks == 1 && yes.uploads == 1);
+	CHECK_STR(yes.uploaded, yes.saved);
+	// Nothing the database said is in it.
+	CHECK(strstr(yes.uploaded, "reports ") == NULL);
+	CHECK_HAS(yes.uploaded, "code 0x60 max 3 write untested\n");
+	CHECK_HAS(out_text, "sent           thank you. A person reads it before it appears on the site.\n");
+
+	// The question comes after the profile is saved, so the person can read the file first.
+	CHECK(strstr(out_text, "profile        ") < strstr(out_text, "sent           "));
+}
+
+static void test_setup_without_a_person_to_ask(void) {
+	// Not in a terminal: nothing is sent, and setup says how to send it.
+	struct fake f = samsung();
+	f.answer = -1;
+	CHECK(run(&f, "setup") == EXIT_OK);
+	CHECK(f.uploads == 0);
+	CHECK_HAS(out_text, "To send this profile to the monitor database, run: monitorctl setup --upload\n");
+
+	// --upload sends without asking.
+	struct fake script = samsung();
+	script.answer = -1;
+	CHECK(run(&script, "setup --upload") == EXIT_OK);
+	CHECK(script.asks == 0 && script.uploads == 1);
+	CHECK_STR(script.uploaded, script.saved);
+	CHECK_HAS(out_text, "sent           thank you.");
+
+	// --offline never asks and never sends.
+	struct fake offline = samsung();
+	offline.answer = 1;
+	CHECK(run(&offline, "setup --offline") == EXIT_OK);
+	CHECK(offline.asks == 0 && offline.uploads == 0);
+	CHECK(strstr(out_text, "monitorctl setup --upload") == NULL);
+}
+
+static void test_setup_upload_outcomes(void) {
+	struct fake known = samsung();
+	known.answer = 1;
+	known.upload_result = 1;
+	CHECK(run(&known, "setup") == EXIT_OK);
+	CHECK_STR(err_text, "");
+	CHECK_HAS(out_text, "sent           the database already has this report from you.\n");
+
+	// A send that fails is reported. The profile is saved all the same.
+	struct fake refused = samsung();
+	refused.answer = 1;
+	refused.upload_result = -2;
+	CHECK(run(&refused, "setup") == EXIT_FAILED);
+	CHECK_HAS(err_text, "The database did not accept the profile.");
+	CHECK(refused.saves == 1);
+	CHECK(strstr(out_text, "sent ") == NULL);
+
+	struct fake down = samsung();
+	down.upload_result = -1;
+	CHECK(run(&down, "setup --upload") == EXIT_FAILED);
+	CHECK_HAS(err_text, "The profile could not be sent.");
+	CHECK(down.saves == 1);
+	CHECK(fake_find(&down, 0x10)->current == 95);
+
+	// A setting that could not be put back still decides the exit code.
+	struct fake stuck = samsung();
+	stuck.answer = 1;
+	fake_find(&stuck, 0x10)->write_limit = 1;
+	CHECK(run(&stuck, "setup") == EXIT_NOT_APPLIED);
+	CHECK(stuck.uploads == 1);
+
+	// Nothing is offered when there is no profile to send.
+	struct fake full = samsung();
+	full.answer = 1;
+	full.save_fails = 1;
+	CHECK(run(&full, "setup") == EXIT_FAILED);
+	CHECK(full.asks == 0 && full.uploads == 0);
+	struct fake off = samsung();
+	off.unreachable = 1;
+	CHECK(run(&off, "setup --upload") == EXIT_FAILED);
+	CHECK(off.uploads == 0);
+}
+
 static void test_help(void) {
 	struct fake f = samsung();
 	CHECK(run(&f, "help") == EXIT_OK);
@@ -1355,6 +1477,9 @@ int main(void) {
 	test_setup_when_the_database_has_nothing_to_say();
 	test_setup_offline();
 	test_setup_database_cannot_cause_a_write();
+	test_setup_asks_before_sending();
+	test_setup_without_a_person_to_ask();
+	test_setup_upload_outcomes();
 	test_help();
 	printf("%d checks, %d failed\n", checks, failures);
 	return failures == 0 ? 0 : 1;
