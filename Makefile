@@ -22,6 +22,7 @@ build/tests: $(CORE) tests/tests.c $(HEADERS)
 
 test: build/tests
 	./build/tests
+	sh tests/install-test.sh
 
 install: build/monitorctl
 	install -d $(PREFIX)/bin

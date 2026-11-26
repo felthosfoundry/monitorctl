@@ -9,12 +9,26 @@ The project page and the monitor database are at [felthosfoundry.com/monitorctl]
 ## Install
 
 ```bash
+curl -fsSL https://felthosfoundry.com/monitorctl/install.sh | sh
+```
+
+This runs [install.sh](install.sh) from this repository. The script downloads the source from GitHub, builds it on your Mac, and copies the program to `~/.local/bin/monitorctl`. It needs the Xcode command-line tools, and it tells you how to get them when they are missing.
+
+The script never asks for a password and never edits your shell's startup files. When `~/.local/bin` is not on your `PATH`, it prints the one line that adds it. To install somewhere else, set `PREFIX`:
+
+```bash
+curl -fsSL https://felthosfoundry.com/monitorctl/install.sh | PREFIX="$HOME/tools" sh
+```
+
+Running the command again installs the newest version.
+
+To build it yourself instead:
+
+```bash
 git clone https://github.com/felthosfoundry/monitorctl.git
 cd monitorctl
 make install
 ```
-
-This builds the tool and copies it to `~/.local/bin/monitorctl`. To install somewhere else, set `PREFIX`, for example `make install PREFIX=/usr/local`. It needs Xcode or the Xcode command-line tools.
 
 ## Use
 
@@ -257,6 +271,8 @@ make test
 
 The tests need no monitor. They run every command against a pretend monitor that answers DDC/CI packets, including one that ignores writes and one that stops answering after it is switched off.
 
+They also run `install.sh` against a tarball of the working tree, with an empty folder as the home folder. That part needs no network.
+
 | File | What it holds |
 |---|---|
 | `src/ddc.c` | Building request packets and checking replies. |
@@ -268,6 +284,7 @@ The tests need no monitor. They run every command against a pretend monitor that
 | `src/info_mac.c` | Reading the model, resolution and Thunderbolt firmware from macOS. |
 | `src/database_curl.c` | Asking the monitor database for a record and sending it a profile, by running the curl that ships with macOS. |
 | `src/ask_tty.c` | Asking a yes-or-no question in the terminal. |
+| `install.sh` | The install command: downloading the source, building it and copying the program into place. |
 
 ## Licence
 
