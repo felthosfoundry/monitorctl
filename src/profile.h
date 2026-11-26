@@ -12,6 +12,7 @@ enum write_result {
 	WRITE_UNTESTED, // setup did not write to this code
 	WRITE_WORKS,    // the monitor applied the write
 	WRITE_IGNORED,  // the monitor accepted the write and the value did not change
+	WRITE_MIXED,    // only in a record from the database: its reports disagree
 };
 
 struct profile_code {
@@ -37,6 +38,12 @@ int profile_id(unsigned vendor, unsigned product, char id[8]);
 
 // Writes the profile as text. Returns the length, or -1 when `size` is too small.
 int profile_format(const struct profile *profile, char *text, size_t size);
+
+// Reads a profile, or a record from the monitor database, which has the same form. The text
+// comes from outside the program, so anything that is not exactly a record for the monitor `id`
+// is refused. `*reports` is the number of reports behind a database record, or 0.
+// Returns 0 on success and -1 otherwise.
+int profile_parse(const char *text, const char *id, struct profile *profile, unsigned *reports);
 
 // Saves a profile's text as <id>.txt in the monitorctl folder under XDG_CONFIG_HOME, or under
 // .config in the home folder. Writes the file's path to `path`. Returns 0 on success.

@@ -4,6 +4,8 @@ A command-line tool that reads and changes an external monitor's settings from a
 
 It talks to the monitor over DDC/CI, the control channel inside the display cable. This is the same channel that the monitor's own menu settings can be reached through.
 
+The project page and the monitor database are at [felthosfoundry.com/monitorctl](https://felthosfoundry.com/monitorctl/).
+
 ## Install
 
 ```bash
@@ -115,6 +117,7 @@ monitorctl setup
 
 ```text
 monitor        C34J79x (SAM0F1E)
+database       1 report for this monitor: https://felthosfoundry.com/monitorctl/SAM0F1E
 codes          35 can be read
 brightness     writes work
 contrast       writes work
@@ -125,20 +128,38 @@ green          writes work
 blue           writes work
 color-preset   writes not tested
 picture-mode   writes not tested
-input          writes not tested
+input          writes not tested here, and are ignored in the database
 power          writes not tested
 profile        /Users/you/.config/monitorctl/SAM0F1E.txt
 ```
 
-It works in three steps:
+It works in four steps:
 
-1. It reads every code from 0x00 to 0xFF and records the ones the monitor supports.
-2. It tests writes on brightness, contrast, volume, mute and the three colour gains. Each one moves by one step, is read back, and is put back. The picture may flicker, and a muted monitor may sound for a moment.
-3. It checks the colour preset and the picture mode, and puts them back if a test changed them as a side effect.
+1. It asks the monitor database what other people found on the same monitor.
+2. It reads every code from 0x00 to 0xFF and records the ones the monitor supports.
+3. It tests writes on brightness, contrast, volume, mute and the three colour gains. Each one moves by one step, is read back, and is put back. The picture may flicker, and a muted monitor may sound for a moment.
+4. It checks the colour preset and the picture mode, and puts them back if a test changed them as a side effect.
 
 `setup` writes to nothing else. It never writes to `input` or `power`, because a monitor that changes input or switches off stops answering, and the old value could then not be put back. It never writes to a factory-reset code or a manufacturer-private code either. Those codes appear in the profile as `untested`.
 
 When a setting cannot be put back, `setup` says which one, still saves the profile, and exits with code 3.
+
+### The monitor database
+
+The [monitor database](https://felthosfoundry.com/monitorctl/) holds what other people's monitors reported. `setup` asks it about your monitor and adds what it learns to the summary in two cases:
+
+- **A control that `setup` does not test.** The line for `input` above says that the database found input writes are ignored on this monitor.
+- **A disagreement.** When your monitor and the database differ, the line says so, for example `writes work here, but are ignored in the database`.
+
+The request goes to `felthosfoundry.com` and carries the monitor's identifier, such as `SAM0F1E`, and nothing else. To skip it, add `--offline`:
+
+```bash
+monitorctl setup --offline
+```
+
+A database that cannot be reached is not an error. `setup` says so and carries on.
+
+The database only describes a monitor. Nothing it returns can make `monitorctl` write to a code, and it cannot unlock a write that needs `--force`. It is also kept out of your profile, so the profile stays a record of what your own monitor did.
 
 ### The profile
 
@@ -157,7 +178,7 @@ code 0x60 max 3 write untested
 
 Each `code` line gives a code the monitor supports, the maximum the monitor reports for it, and what happened when `setup` tested a write: `works`, `ignored` or `untested`. A line for a fact that is not known is left out.
 
-The profile holds no serial number and none of your current settings. `setup` saves it under `~/.config/monitorctl/`, or under `$XDG_CONFIG_HOME/monitorctl/` when that is set, and sends it nowhere. The other commands do not read the profile yet.
+The profile holds no serial number and none of your current settings. `setup` saves it under `~/.config/monitorctl/`, or under `$XDG_CONFIG_HOME/monitorctl/` when that is set. The profile itself is never sent anywhere. To add your monitor to the database, see the [project page](https://felthosfoundry.com/monitorctl/). The other commands do not read the profile yet.
 
 ## Writes are checked
 
@@ -223,9 +244,10 @@ The tests need no monitor. They run every command against a pretend monitor that
 | `src/controls.c` | The named controls, value names and the guard list. |
 | `src/cli.c` | Turning the command line into a command. |
 | `src/run.c` | Carrying out a command through a transport. |
-| `src/profile.c` | Building a monitor's identifier, and writing and saving its profile. |
+| `src/profile.c` | Building a monitor's identifier, and writing, reading and saving a profile. |
 | `src/transport_mac.c` | The only code that touches hardware. |
 | `src/info_mac.c` | Reading the model, resolution and Thunderbolt firmware from macOS. |
+| `src/lookup_curl.c` | Asking the monitor database for a record, by running the curl that ships with macOS. |
 
 ## Licence
 

@@ -30,6 +30,9 @@ struct transport {
 	int (*info)(void *ctx, struct display_info *info);
 	// Stores a profile's text under the monitor's identifier and writes where it went to `path`.
 	int (*save)(void *ctx, const char *id, const char *text, char *path, size_t size);
+	// Asks the monitor database for the record of the monitor `id`. Returns 0 with the record in
+	// `text`, 1 when the database has no reports for it, and -1 when it could not be reached.
+	int (*lookup)(void *ctx, const char *id, char *text, size_t size);
 };
 
 // Exit codes.
