@@ -41,7 +41,7 @@ static void append_fact(char *text, size_t size, size_t *used, const char *key, 
 }
 
 int profile_format(const struct profile *profile, char *text, size_t size) {
-	static const char *RESULTS[] = {[WRITE_UNTESTED] = "untested", [WRITE_WORKS] = "works", [WRITE_IGNORED] = "ignored"};
+	static const char *RESULTS[] = {[WRITE_UNTESTED] = "untested", [WRITE_WORKS] = "works", [WRITE_IGNORED] = "ignored", [WRITE_MIXED] = "mixed"};
 	size_t used = 0;
 	append(text, size, &used, "monitorctl-profile 1\n");
 	append_fact(text, size, &used, "id", profile->id);
@@ -55,6 +55,66 @@ int profile_format(const struct profile *profile, char *text, size_t size) {
 		append(text, size, &used, "code 0x%02X max %u write %s\n", c->code, c->maximum, RESULTS[c->write]);
 	}
 	return used < size ? (int)used : -1;
+}
+
+#define MAX_LINES 400
+
+// Reads a whole number of up to nine digits and nothing else. Returns 0 on success.
+static int parse_count(const char *text, unsigned *number) {
+	size_t digits = strspn(text, "0123456789");
+	if (digits == 0 || digits > 9 || text[digits] != '\0') return -1;
+	*number = (unsigned)strtoul(text, NULL, 10);
+	return 0;
+}
+
+int profile_parse(const char *text, const char *id, struct profile *profile, unsigned *reports) {
+	static const struct {
+		const char *word;
+		enum write_result result;
+	} RESULTS[] = {{"untested", WRITE_UNTESTED}, {"works", WRITE_WORKS}, {"ignored", WRITE_IGNORED}, {"mixed", WRITE_MIXED}};
+
+	memset(profile, 0, sizeof *profile);
+	*reports = 0;
+	int lines = 0, has_id = 0, has_reports = 0;
+	char seen[256] = {0};
+
+	for (const char *at = text; *at;) {
+		// Take one line, without its line ending. The longest real line is the capability string.
+		size_t length = strcspn(at, "\n"), kept = length;
+		if (kept > 0 && at[kept - 1] == '\r') kept--;
+		char line[4200];
+		if (kept >= sizeof line || ++lines > MAX_LINES) return -1;
+		memcpy(line, at, kept);
+		line[kept] = '\0';
+		at += length + (at[length] == '\n');
+
+		if (lines == 1) {
+			if (strcmp(line, "monitorctl-profile 1") != 0) return -1;
+		} else if (strncmp(line, "id ", 3) == 0) {
+			if (has_id || strcmp(line + 3, id) != 0) return -1;
+			has_id = 1;
+			snprintf(profile->id, sizeof profile->id, "%s", id);
+		} else if (strncmp(line, "model ", 6) == 0) {
+			snprintf(profile->model, sizeof profile->model, "%s", line + 6);
+		} else if (strncmp(line, "reports ", 8) == 0) {
+			if (has_reports || parse_count(line + 8, reports) != 0) return -1;
+			has_reports = 1;
+		} else if (strncmp(line, "code ", 5) == 0) {
+			unsigned code, maximum;
+			char word[16], exact[64];
+			if (sscanf(line, "code 0x%2x max %5u write %15s", &code, &maximum, word) != 3 || maximum > 0xFFFF) return -1;
+			// Writing the line back out and comparing refuses every other spelling of it.
+			snprintf(exact, sizeof exact, "code 0x%02X max %u write %s", code, maximum, word);
+			if (strcmp(exact, line) != 0 || seen[code]) return -1;
+			size_t which = 0;
+			while (which < sizeof RESULTS / sizeof RESULTS[0] && strcmp(RESULTS[which].word, word) != 0) which++;
+			if (which == sizeof RESULTS / sizeof RESULTS[0]) return -1;
+			seen[code] = 1;
+			profile->codes[profile->count++] = (struct profile_code){(uint8_t)code, (uint16_t)maximum, RESULTS[which].result};
+		}
+		// Any other line belongs to a fact this version does not use, and is skipped.
+	}
+	return has_id && profile->count > 0 ? 0 : -1;
 }
 
 // Makes one folder. A folder that is already there is fine.

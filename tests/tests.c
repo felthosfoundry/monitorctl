@@ -71,6 +71,10 @@ struct fake {
 	char saved[16384];               // the text of the last saved profile
 	int saves;                       // how many profiles were saved
 	int save_fails;                  // the computer cannot save a profile
+	const char *db_record;           // what the monitor database holds for this monitor, or NULL
+	int db_unreachable;              // the monitor database cannot be reached
+	int lookups;                     // how many times the database was asked
+	char lookup_id[16];              // the identifier the database was last asked about
 };
 
 static struct setting *fake_find(struct fake *f, uint8_t code) {
@@ -170,6 +174,16 @@ static int fake_save(void *ctx, const char *id, const char *text, char *path, si
 	return 0;
 }
 
+static int fake_lookup(void *ctx, const char *id, char *text, size_t size) {
+	struct fake *f = ctx;
+	f->lookups++;
+	snprintf(f->lookup_id, sizeof f->lookup_id, "%s", id);
+	if (f->db_unreachable) return -1;
+	if (!f->db_record) return 1;
+	snprintf(text, size, "%s", f->db_record);
+	return 0;
+}
+
 static struct fake samsung(void) {
 	struct fake f = {
 		.settings = {
@@ -212,7 +226,7 @@ static int run(struct fake *f, const char *line) {
 	size_t out_size = 0, err_size = 0;
 	FILE *out = open_memstream(&out_buffer, &out_size);
 	FILE *err = open_memstream(&err_buffer, &err_size);
-	struct transport t = {f, fake_write, fake_read, fake_pause, fake_info, fake_save};
+	struct transport t = {f, fake_write, fake_read, fake_pause, fake_info, fake_save, fake_lookup};
 	int code = run_command(&cmd, &t, out, err);
 	fclose(out);
 	fclose(err);
@@ -438,6 +452,11 @@ static void test_cli(void) {
 	CHECK(parse("setup", &c, err, sizeof err) == 0 && c.verb == VERB_SETUP);
 	CHECK(parse("setup extra", &c, err, sizeof err) == -1);
 	CHECK_STR(err, "Too many arguments for setup.");
+	CHECK(parse("setup", &c, err, sizeof err) == 0 && !c.offline);
+	CHECK(parse("setup --offline", &c, err, sizeof err) == 0 && c.verb == VERB_SETUP && c.offline);
+	CHECK(parse("--offline setup", &c, err, sizeof err) == 0 && c.offline);
+	CHECK(parse("list --offline", &c, err, sizeof err) == -1);
+	CHECK_STR(err, "--offline only applies to setup.");
 
 	CHECK(parse("get brightness", &c, err, sizeof err) == 0);
 	CHECK(c.verb == VERB_GET && c.code == 0x10 && c.control == control_find("brightness") && !c.force);
@@ -482,6 +501,7 @@ static void test_cli(void) {
 	CHECK_HAS(cli_usage(), "monitorctl info");
 	CHECK_HAS(cli_usage(), "monitorctl timing");
 	CHECK_HAS(cli_usage(), "monitorctl setup");
+	CHECK_HAS(cli_usage(), "--offline");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -845,6 +865,76 @@ static void test_profile_format(void) {
 	CHECK(profile_format(&p, small, sizeof small) == -1);
 }
 
+static void test_profile_parse(void) {
+	struct profile p;
+	unsigned reports = 99;
+	const char *text =
+		"monitorctl-profile 1\n"
+		"id SAM0F1E\n"
+		"model C34J79x\n"
+		"reports 3\n"
+		"something from a newer version\n"
+		"code 0x10 max 100 write works\n"
+		"code 0x60 max 3 write ignored\n"
+		"code 0x62 max 100 write mixed\n"
+		"code 0xD6 max 4 write untested\n";
+	CHECK(profile_parse(text, "SAM0F1E", &p, &reports) == 0);
+	CHECK_STR(p.id, "SAM0F1E");
+	CHECK_STR(p.model, "C34J79x");
+	CHECK(reports == 3);
+	CHECK(p.count == 4);
+	CHECK(p.codes[0].code == 0x10 && p.codes[0].maximum == 100 && p.codes[0].write == WRITE_WORKS);
+	CHECK(p.codes[1].code == 0x60 && p.codes[1].maximum == 3 && p.codes[1].write == WRITE_IGNORED);
+	CHECK(p.codes[2].code == 0x62 && p.codes[2].write == WRITE_MIXED);
+	CHECK(p.codes[3].code == 0xD6 && p.codes[3].write == WRITE_UNTESTED);
+
+	// A profile that setup wrote reads back, and Windows line endings are accepted.
+	struct profile made = {.id = "SAM0F1E", .model = "C34J79x", .year = 2022, .week = 44, .thunderbolt = "61.2",
+		.caps = "(prot(monitor))", .codes = {{0x10, 100, WRITE_WORKS}, {0xDC, 3, WRITE_IGNORED}}, .count = 2};
+	char written[1024];
+	CHECK(profile_format(&made, written, sizeof written) > 0);
+	CHECK(profile_parse(written, "SAM0F1E", &p, &reports) == 0);
+	CHECK(p.count == 2 && p.codes[1].code == 0xDC && p.codes[1].write == WRITE_IGNORED);
+	CHECK(reports == 0);
+	CHECK(profile_parse("monitorctl-profile 1\r\nid SAM0F1E\r\ncode 0x10 max 100 write works\r\n", "SAM0F1E", &p, &reports) == 0);
+	CHECK(p.count == 1);
+
+	// Anything else is refused whole.
+	static const char *bad[] = {
+		"",
+		"hello\n",
+		"monitorctl-profile 2\nid SAM0F1E\ncode 0x10 max 100 write works\n",
+		"monitorctl-profile 1\ncode 0x10 max 100 write works\n",                             // no id
+		"monitorctl-profile 1\nid DELA0B8\ncode 0x10 max 100 write works\n",                 // another monitor
+		"monitorctl-profile 1\nid SAM0F1E\n",                                                // no codes
+		"monitorctl-profile 1\nid SAM0F1E\ncode 0x10 max 100 write maybe\n",
+		"monitorctl-profile 1\nid SAM0F1E\ncode 0x1g max 100 write works\n",
+		"monitorctl-profile 1\nid SAM0F1E\ncode 16 max 100 write works\n",
+		"monitorctl-profile 1\nid SAM0F1E\ncode 0x10 max 65536 write works\n",
+		"monitorctl-profile 1\nid SAM0F1E\ncode 0x10 max 100 write works extra\n",
+		"monitorctl-profile 1\nid SAM0F1E\ncode 0x10 max 100 write works\ncode 0x10 max 100 write works\n",
+		"monitorctl-profile 1\nid SAM0F1E\nreports many\ncode 0x10 max 100 write works\n",
+	};
+	for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+		checks++;
+		if (profile_parse(bad[i], "SAM0F1E", &p, &reports) != -1) {
+			failures++;
+			fprintf(stderr, "FAIL %s:%d: accepted bad record %zu\n", __FILE__, __LINE__, i);
+		}
+	}
+
+	// A line longer than any real one is refused, and so is a record with too many lines.
+	static char huge[9000];
+	int at = snprintf(huge, sizeof huge, "monitorctl-profile 1\nid SAM0F1E\nmodel ");
+	memset(huge + at, 'x', 6000);
+	snprintf(huge + at + 6000, sizeof huge - (size_t)at - 6000, "\ncode 0x10 max 100 write works\n");
+	CHECK(profile_parse(huge, "SAM0F1E", &p, &reports) == -1);
+	static char many[20000];
+	at = snprintf(many, sizeof many, "monitorctl-profile 1\nid SAM0F1E\ncode 0x10 max 100 write works\n");
+	for (int i = 0; i < 600; i++) at += snprintf(many + at, sizeof many - (size_t)at, "note line %d\n", i);
+	CHECK(profile_parse(many, "SAM0F1E", &p, &reports) == -1);
+}
+
 static void read_file(const char *path, char *text, size_t size) {
 	text[0] = '\0';
 	FILE *file = fopen(path, "r");
@@ -1105,6 +1195,116 @@ static void test_setup_with_facts_missing(void) {
 	CHECK_HAS(out_text, "monitor        unknown model (SAM0F1E)\n");
 }
 
+// What three other people found on the same monitor. It disagrees with this monitor about
+// contrast, and it knows about two controls that setup does not test.
+static const char *DATABASE =
+	"monitorctl-profile 1\n"
+	"id SAM0F1E\n"
+	"model C34J79x\n"
+	"reports 3\n"
+	"code 0x10 max 100 write works\n"
+	"code 0x12 max 100 write ignored\n"
+	"code 0x14 max 11 write works\n"
+	"code 0x60 max 3 write ignored\n"
+	"code 0x62 max 100 write mixed\n"
+	"code 0xD6 max 4 write untested\n";
+
+static void test_setup_shows_what_the_database_knows(void) {
+	struct fake f = samsung();
+	f.db_record = DATABASE;
+	CHECK(run(&f, "setup") == EXIT_OK);
+	CHECK_STR(err_text, "");
+	CHECK(f.lookups == 1);
+	CHECK_STR(f.lookup_id, "SAM0F1E");
+	CHECK_HAS(out_text, "Asking felthosfoundry.com what is known about SAM0F1E.\n");
+	CHECK_HAS(out_text, "database       3 reports for this monitor: https://felthosfoundry.com/monitorctl/SAM0F1E\n");
+	// Where the database agrees, or its reports disagree with each other, the line is as before.
+	CHECK_HAS(out_text, "brightness     writes work\n");
+	CHECK_HAS(out_text, "volume         writes work\n");
+	CHECK_HAS(out_text, "power          writes not tested\n");
+	CHECK_HAS(out_text, "contrast       writes work here, but are ignored in the database\n");
+	CHECK_HAS(out_text, "color-preset   writes not tested here, and work in the database\n");
+	CHECK_HAS(out_text, "input          writes not tested here, and are ignored in the database\n");
+
+	// The database changes what is said, and nothing else: the same writes, the same profile.
+	CHECK(f.sets == 8);
+	CHECK(f.wrote[0x60] == 0 && f.wrote[0x14] == 0 && f.wrote[0xD6] == 0);
+	CHECK_HAS(f.saved, "code 0x12 max 100 write works\n");
+	CHECK_HAS(f.saved, "code 0x14 max 11 write untested\n");
+	CHECK_HAS(f.saved, "code 0x60 max 3 write untested\n");
+	CHECK(strstr(f.saved, "reports ") == NULL);
+}
+
+static void test_setup_database_wording(void) {
+	// This monitor ignores brightness writes, and the database says they work.
+	struct fake f = samsung();
+	fake_find(&f, 0x10)->ignores_writes = 1;
+	f.db_record = "monitorctl-profile 1\nid SAM0F1E\nreports 1\ncode 0x10 max 100 write works\ncode 0x60 max 3 write mixed\n";
+	CHECK(run(&f, "setup") == EXIT_OK);
+	CHECK_HAS(out_text, "database       1 report for this monitor: https://felthosfoundry.com/monitorctl/SAM0F1E\n");
+	CHECK_HAS(out_text, "brightness     writes are ignored here, but work in the database\n");
+	CHECK_HAS(out_text, "input          writes not tested here, and reports in the database disagree\n");
+	CHECK_HAS(out_text, "red            not supported\n");
+}
+
+static void test_setup_when_the_database_has_nothing_to_say(void) {
+	struct fake none = samsung();
+	CHECK(run(&none, "setup") == EXIT_OK);
+	CHECK(none.lookups == 1);
+	CHECK_HAS(out_text, "database       no reports for this monitor yet. To add yours, see https://felthosfoundry.com/monitorctl/\n");
+	CHECK_HAS(out_text, "input          writes not tested\n");
+
+	// A database that cannot be reached is not an error.
+	struct fake down = samsung();
+	down.db_unreachable = 1;
+	CHECK(run(&down, "setup") == EXIT_OK);
+	CHECK_STR(err_text, "");
+	CHECK_HAS(out_text, "database       could not be reached\n");
+	CHECK(down.saves == 1);
+
+	// Neither is an answer that is not a record, or a record for a different monitor.
+	struct fake junk = samsung();
+	junk.db_record = "<html>Service unavailable</html>";
+	CHECK(run(&junk, "setup") == EXIT_OK);
+	CHECK_HAS(out_text, "database       sent an answer monitorctl could not read\n");
+	struct fake wrong = samsung();
+	wrong.db_record = "monitorctl-profile 1\nid DELA0B8\nreports 2\ncode 0x60 max 18 write works\n";
+	CHECK(run(&wrong, "setup") == EXIT_OK);
+	CHECK_HAS(out_text, "database       sent an answer monitorctl could not read\n");
+	CHECK_HAS(out_text, "input          writes not tested\n");
+}
+
+static void test_setup_offline(void) {
+	struct fake f = samsung();
+	f.db_record = DATABASE;
+	CHECK(run(&f, "setup --offline") == EXIT_OK);
+	CHECK(f.lookups == 0);
+	CHECK(strstr(out_text, "Asking felthosfoundry.com") == NULL);
+	CHECK_HAS(out_text, "database       not asked, because of --offline\n");
+	CHECK_HAS(out_text, "input          writes not tested\n");
+	CHECK(f.saves == 1);
+}
+
+static void test_setup_database_cannot_cause_a_write(void) {
+	// A record that claims every risky code works changes no behaviour.
+	struct fake f = samsung();
+	f.settings[f.count++] = (struct setting){.code = 0x04, .current = 0, .maximum = 1};
+	f.settings[f.count++] = (struct setting){.code = 0xE2, .current = 0, .maximum = 2};
+	f.db_record = "monitorctl-profile 1\nid SAM0F1E\nreports 9\ncode 0x04 max 1 write works\ncode 0x14 max 11 write works\n"
+		"code 0x60 max 3 write works\ncode 0xD6 max 4 write works\ncode 0xE2 max 2 write works\n";
+	CHECK(run(&f, "setup") == EXIT_OK);
+	static const uint8_t tested[] = {0x10, 0x12, 0x62, 0x8D, 0x16, 0x18, 0x1A};
+	CHECK(total_writes_outside(&f, tested, sizeof tested) == 0);
+	CHECK(f.sets == 8);
+	CHECK(fake_find(&f, 0xD6)->current == 1);
+
+	// The database is not asked when the monitor cannot be identified.
+	struct fake unknown = samsung();
+	unknown.info.vendor = 0;
+	CHECK(run(&unknown, "setup") == EXIT_FAILED);
+	CHECK(unknown.lookups == 0);
+}
+
 static void test_help(void) {
 	struct fake f = samsung();
 	CHECK(run(&f, "help") == EXIT_OK);
@@ -1141,6 +1341,7 @@ int main(void) {
 	test_profile_id();
 	test_profile_format();
 	test_profile_save();
+	test_profile_parse();
 	test_setup();
 	test_setup_never_writes_risky_codes();
 	test_setup_when_the_monitor_ignores_a_write();
@@ -1149,6 +1350,11 @@ int main(void) {
 	test_setup_when_a_setting_cannot_be_put_back();
 	test_setup_failures();
 	test_setup_with_facts_missing();
+	test_setup_shows_what_the_database_knows();
+	test_setup_database_wording();
+	test_setup_when_the_database_has_nothing_to_say();
+	test_setup_offline();
+	test_setup_database_cannot_cause_a_write();
 	test_help();
 	printf("%d checks, %d failed\n", checks, failures);
 	return failures == 0 ? 0 : 1;

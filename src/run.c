@@ -304,11 +304,36 @@ static int test_target(const struct control *control, const struct vcp_value *no
 	return 0;
 }
 
+#define DATABASE_PAGE "https://felthosfoundry.com/monitorctl/"
+
+// One line of setup's summary for a named control: what this monitor did, and what the database
+// says when that adds something. A database record only ever changes this wording.
+static void control_line(FILE *out, const char *name, const struct profile_code *here, const struct profile_code *there) {
+	static const char *PLAIN[] = {[WRITE_UNTESTED] = "writes not tested", [WRITE_WORKS] = "writes work", [WRITE_IGNORED] = "writes are ignored"};
+	if (!here) {
+		fprintf(out, "%-14s not supported\n", name);
+		return;
+	}
+	const char *more = "";
+	if (there && here->write == WRITE_UNTESTED) {
+		if (there->write == WRITE_WORKS) more = " here, and work in the database";
+		else if (there->write == WRITE_IGNORED) more = " here, and are ignored in the database";
+		else if (there->write == WRITE_MIXED) more = " here, and reports in the database disagree";
+	} else if (there && here->write == WRITE_WORKS && there->write == WRITE_IGNORED) {
+		more = " here, but are ignored in the database";
+	} else if (there && here->write == WRITE_IGNORED && there->write == WRITE_WORKS) {
+		more = " here, but work in the database";
+	}
+	fprintf(out, "%-14s %s%s\n", name, PLAIN[here->write], more);
+}
+
 // Finds out what the monitor supports and saves the result as a profile.
 // It reads every code, then tests writes on the controls marked for it in controls.c. Each tested
 // control moves one step and is put back, and so is any watched control that a test changed as a
 // side effect. No other code is written.
-static int run_setup(const struct transport *t, FILE *out, FILE *err) {
+// Unless --offline is given, it also asks the monitor database what other people found on the
+// same monitor. The answer is shown next to this monitor's results and changes nothing else.
+static int run_setup(const struct command *cmd, const struct transport *t, FILE *out, FILE *err) {
 	struct display_info info;
 	struct profile profile;
 	memset(&info, 0, sizeof info);
@@ -321,6 +346,24 @@ static int run_setup(const struct transport *t, FILE *out, FILE *err) {
 	snprintf(profile.thunderbolt, sizeof profile.thunderbolt, "%s", info.thunderbolt);
 	profile.year = info.year;
 	profile.week = info.week;
+
+	// Ask the database first, so a slow network never sits between a test write and its undo.
+	enum { NOT_ASKED, FOUND, NO_REPORTS, UNREACHABLE, UNREADABLE } database = NOT_ASKED;
+	struct profile known;
+	unsigned known_reports = 0;
+	int known_slot[256] = {0};
+	if (!cmd->offline) {
+		fprintf(out, "Asking felthosfoundry.com what is known about %s.\n", profile.id);
+		fflush(out);
+		char record[32768];
+		int answer = t->lookup(t->ctx, profile.id, record, sizeof record);
+		if (answer < 0) database = UNREACHABLE;
+		else if (answer > 0) database = NO_REPORTS;
+		else if (profile_parse(record, profile.id, &known, &known_reports) != 0) database = UNREADABLE;
+		else database = FOUND;
+		if (database == FOUND)
+			for (int i = 0; i < known.count; i++) known_slot[known.codes[i].code] = i + 1;
+	}
 
 	fputs("Reading every code, then testing a few writes. This takes about half a minute.\n"
 	      "The picture may flicker. Every setting that is tested is put back.\n\n", out);
@@ -383,11 +426,15 @@ static int run_setup(const struct transport *t, FILE *out, FILE *err) {
 	}
 
 	fprintf(out, "%-14s %s (%s)\n", "monitor", profile.model[0] ? profile.model : "unknown model", profile.id);
+	if (database == FOUND) fprintf(out, "%-14s %u report%s for this monitor: " DATABASE_PAGE "%s\n", "database", known_reports, known_reports == 1 ? "" : "s", profile.id);
+	else if (database == NO_REPORTS) fprintf(out, "%-14s no reports for this monitor yet. To add yours, see " DATABASE_PAGE "\n", "database");
+	else if (database == UNREACHABLE) fprintf(out, "%-14s could not be reached\n", "database");
+	else if (database == UNREADABLE) fprintf(out, "%-14s sent an answer monitorctl could not read\n", "database");
+	else fprintf(out, "%-14s not asked, because of --offline\n", "database");
 	fprintf(out, "%-14s %d can be read\n", "codes", profile.count);
 	for (size_t i = 0; i < count; i++) {
-		static const char *RESULTS[] = {[WRITE_UNTESTED] = "writes not tested", [WRITE_WORKS] = "writes work", [WRITE_IGNORED] = "writes are ignored"};
-		int at = slot[controls[i].code];
-		fprintf(out, "%-14s %s\n", controls[i].name, at ? RESULTS[profile.codes[at - 1].write] : "not supported");
+		int here = slot[controls[i].code], there = known_slot[controls[i].code];
+		control_line(out, controls[i].name, here ? &profile.codes[here - 1] : NULL, there ? &known.codes[there - 1] : NULL);
 	}
 
 	char text[16384], path[1024];
@@ -421,7 +468,7 @@ int run_command(const struct command *cmd, const struct transport *t, FILE *out,
 	case VERB_TIMING:
 		return run_timing(t, out, err);
 	case VERB_SETUP:
-		return run_setup(t, out, err);
+		return run_setup(cmd, t, out, err);
 	}
 	return EXIT_USAGE;
 }
