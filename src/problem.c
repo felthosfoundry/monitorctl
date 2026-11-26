@@ -42,9 +42,12 @@ static void append(char *text, size_t size, size_t *used, const char *format, ..
 }
 
 // Adds text that came from the monitor or a device. Any character that could start a new line
-// is replaced with a space.
+// is replaced with a space. The site accepts only plain ASCII, so any other byte becomes "?".
 static void append_clean(char *text, size_t size, size_t *used, const char *value) {
-	for (const char *c = value; *c; c++) append(text, size, used, "%c", iscntrl((unsigned char)*c) ? ' ' : *c);
+	for (const char *c = value; *c; c++) {
+		unsigned char byte = (unsigned char)*c;
+		append(text, size, used, "%c", iscntrl(byte) ? ' ' : byte > 0x7E ? '?' : *c);
+	}
 }
 
 static void append_fact(char *text, size_t size, size_t *used, const char *key, const char *value) {

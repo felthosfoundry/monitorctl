@@ -1318,7 +1318,7 @@ static void test_problem_format(void) {
 
 	// Facts the computer does not know are left out, and text from outside cannot start a line.
 	struct display_info bare = {.model = "Odd\nid EVIL", .thunderbolt = "61.2", .device_count = 1,
-		.devices = {{.vendor = "A\tB", .model = "C\rD"}}};
+		.devices = {{.vendor = "A\tB", .model = "C\rD\xC3\xA9"}}};
 	struct attempt none[1] = {{.sent = 0}};
 	CHECK(problem_format("SAM0F1E", &bare, none, 1, text, sizeof text) > 0);
 	CHECK_STR(text,
@@ -1328,7 +1328,7 @@ static void test_problem_format(void) {
 		"thunderbolt 61.2\n"
 		"displays 0\n"
 		"channels 0\n"
-		"device A B C D\n"
+		"device A B C D??\n"
 		"step scan\n"
 		"cause not-sent\n"
 		"try 1 write 0x00000000\n");
