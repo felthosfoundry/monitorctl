@@ -4,6 +4,7 @@
 #include "transport_mac.h"
 
 #include "info_mac.h"
+#include "profile.h"
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -57,5 +58,6 @@ int transport_mac_open(struct transport *t) {
 	t->read = mac_read;
 	t->pause = mac_pause;
 	t->info = info_mac_read;
+	t->save = profile_save;
 	return 0;
 }

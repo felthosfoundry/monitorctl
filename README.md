@@ -47,6 +47,7 @@ The other commands are:
 | `caps` | Prints the monitor's own capability string. | `monitorctl caps` |
 | `info` | Shows the model, resolution, Thunderbolt firmware and capability string. | `monitorctl info` |
 | `timing` | Shows the signal the monitor says it is receiving. | `monitorctl timing` |
+| `setup` | Tests what the monitor supports and saves the result as a profile. | `monitorctl setup` |
 | `help` | Shows the usage text. | `monitorctl help` |
 
 A control is one of the names from `list`, or a raw code such as `0x10`. A value is a number. Some controls also take names:
@@ -104,6 +105,60 @@ It is a read, so nothing on the monitor changes. `info` reports the resolution m
 
 The two rates are the same numbers as codes `0xAC` and `0xAE`. No settings code reports the last line.
 
+## What your monitor supports
+
+```bash
+monitorctl setup
+```
+
+`setup` finds out what the connected monitor supports and saves the answer as a profile. It takes about half a minute:
+
+```text
+monitor        C34J79x (SAM0F1E)
+codes          35 can be read
+brightness     writes work
+contrast       writes work
+volume         writes work
+mute           writes work
+red            writes work
+green          writes work
+blue           writes work
+color-preset   writes not tested
+picture-mode   writes not tested
+input          writes not tested
+power          writes not tested
+profile        /Users/you/.config/monitorctl/SAM0F1E.txt
+```
+
+It works in three steps:
+
+1. It reads every code from 0x00 to 0xFF and records the ones the monitor supports.
+2. It tests writes on brightness, contrast, volume, mute and the three colour gains. Each one moves by one step, is read back, and is put back. The picture may flicker, and a muted monitor may sound for a moment.
+3. It checks the colour preset and the picture mode, and puts them back if a test changed them as a side effect.
+
+`setup` writes to nothing else. It never writes to `input` or `power`, because a monitor that changes input or switches off stops answering, and the old value could then not be put back. It never writes to a factory-reset code or a manufacturer-private code either. Those codes appear in the profile as `untested`.
+
+When a setting cannot be put back, `setup` says which one, still saves the profile, and exits with code 3.
+
+### The profile
+
+The monitor's identifier is the three manufacturer letters and the product number from its EDID, such as `SAM0F1E`. The profile is a plain text file named after it, with one fact per line:
+
+```text
+monitorctl-profile 1
+id SAM0F1E
+model C34J79x
+built 2022 week 44
+thunderbolt 61.2
+caps (prot(monitor)type(lcd)model(FALCON)...)
+code 0x10 max 100 write works
+code 0x60 max 3 write untested
+```
+
+Each `code` line gives a code the monitor supports, the maximum the monitor reports for it, and what happened when `setup` tested a write: `works`, `ignored` or `untested`. A line for a fact that is not known is left out.
+
+The profile holds no serial number and none of your current settings. `setup` saves it under `~/.config/monitorctl/`, or under `$XDG_CONFIG_HOME/monitorctl/` when that is set, and sends it nowhere. The other commands do not read the profile yet.
+
 ## Writes are checked
 
 A monitor replies "accepted" to a write even when it then ignores it. So after every write, `monitorctl` reads the value back. When the value did not change, it says so and exits with code 3:
@@ -134,7 +189,7 @@ pmset displaysleepnow
 | 0 | Done. |
 | 1 | The monitor did not answer, or does not support the code. |
 | 2 | The command line was wrong. |
-| 3 | The monitor accepted a write and the value did not change. |
+| 3 | The monitor accepted a write and the value did not change, or `setup` could not put a setting back. |
 | 4 | The write is guarded and `--force` was not given. |
 
 ## Tested monitor
@@ -168,6 +223,7 @@ The tests need no monitor. They run every command against a pretend monitor that
 | `src/controls.c` | The named controls, value names and the guard list. |
 | `src/cli.c` | Turning the command line into a command. |
 | `src/run.c` | Carrying out a command through a transport. |
+| `src/profile.c` | Building a monitor's identifier, and writing and saving its profile. |
 | `src/transport_mac.c` | The only code that touches hardware. |
 | `src/info_mac.c` | Reading the model, resolution and Thunderbolt firmware from macOS. |
 

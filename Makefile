@@ -5,7 +5,7 @@ CC := xcrun clang
 CFLAGS := -std=c11 -O2 -Wall -Wextra -Werror -isysroot $(SDK)
 PREFIX ?= $(HOME)/.local
 
-CORE := src/ddc.c src/controls.c src/cli.c src/run.c
+CORE := src/ddc.c src/controls.c src/cli.c src/profile.c src/run.c
 HEADERS := $(wildcard src/*.h)
 
 all: build/monitorctl

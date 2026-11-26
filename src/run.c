@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "ddc.h"
+#include "profile.h"
 
 #define ATTEMPTS 4
 #define REPLY_WAIT_MS 60  // a monitor needs a moment between a request and its reply
@@ -57,14 +58,13 @@ static int refuse_if_guarded(const struct command *cmd, uint16_t value, FILE *er
 	return EXIT_REFUSED;
 }
 
-// Sends a write, then reads the value back to confirm the monitor applied it.
-static int write_and_confirm(const struct command *cmd, const struct transport *t, uint16_t value, FILE *err) {
+// Sends a write, then reads the value back. Returns 0 when the monitor now reports `value`, and 1
+// when it reports something else, which is left in `*now`. Returns -1 when the write could not be
+// sent, and -2 when it was sent and the value could not be read back.
+static int vcp_set(const struct transport *t, uint8_t code, uint16_t value, uint16_t *now) {
 	uint8_t packet[DDC_MAX_PACKET];
-	size_t n = ddc_set_request(cmd->code, value, packet);
-	if (t->write(t->ctx, packet, n) != 0) {
-		fputs(NO_ANSWER, err);
-		return EXIT_FAILED;
-	}
+	size_t n = ddc_set_request(code, value, packet);
+	if (t->write(t->ctx, packet, n) != 0) return -1;
 
 	// A monitor answers "accepted" to writes it then ignores, so only a read shows what happened.
 	// Some settings take a moment to change, so a mismatch is checked a second time.
@@ -72,17 +72,30 @@ static int write_and_confirm(const struct command *cmd, const struct transport *
 	int result = -1;
 	for (int check = 0; check < 2; check++) {
 		t->pause(t->ctx, SETTLE_MS);
-		result = vcp_get(t, cmd->code, &after);
+		result = vcp_get(t, code, &after);
 		if (result != 0 || after.current == value) break;
 	}
-	if (result != 0) {
+	if (result != 0) return -2;
+	*now = after.current;
+	return after.current == value ? 0 : 1;
+}
+
+// Sends a write and explains anything that went wrong.
+static int write_and_confirm(const struct command *cmd, const struct transport *t, uint16_t value, FILE *err) {
+	uint16_t now = 0;
+	int result = vcp_set(t, cmd->code, value, &now);
+	if (result == -1) {
+		fputs(NO_ANSWER, err);
+		return EXIT_FAILED;
+	}
+	if (result == -2) {
 		fputs("The command was sent, but the value could not be read back.\n", err);
 		return EXIT_OK;
 	}
-	if (after.current != value) {
+	if (result == 1) {
 		char what[64];
 		describe(cmd, what, sizeof what, 0);
-		fprintf(err, "The monitor accepted the command, but %s is still %u.\n", what, after.current);
+		fprintf(err, "The monitor accepted the command, but %s is still %u.\n", what, now);
 		return EXIT_NOT_APPLIED;
 	}
 	return EXIT_OK;
@@ -277,6 +290,115 @@ static int run_timing(const struct transport *t, FILE *out, FILE *err) {
 	return EXIT_OK;
 }
 
+// The value setup writes to test a control: one step away from where the control is now.
+// Returns 0, or -1 when the control is in a state setup does not test.
+static int test_target(const struct control *control, const struct vcp_value *now, uint16_t *target) {
+	if (control->probe == PROBE_TOGGLE) {
+		if (now->current != 1 && now->current != 2) return -1;
+		*target = now->current == 1 ? 2 : 1;
+		return 0;
+	}
+	// Step up when there is room, and down from the top. A maximum of 0 means "no limit given".
+	int room_above = now->maximum > 0 ? now->current < now->maximum : now->current == 0;
+	*target = (uint16_t)(room_above ? now->current + 1 : now->current - 1);
+	return 0;
+}
+
+// Finds out what the monitor supports and saves the result as a profile.
+// It reads every code, then tests writes on the controls marked for it in controls.c. Each tested
+// control moves one step and is put back, and so is any watched control that a test changed as a
+// side effect. No other code is written.
+static int run_setup(const struct transport *t, FILE *out, FILE *err) {
+	struct display_info info;
+	struct profile profile;
+	memset(&info, 0, sizeof info);
+	memset(&profile, 0, sizeof profile);
+	if (t->info(t->ctx, &info) != 0 || profile_id(info.vendor, info.product, profile.id) != 0) {
+		fputs("The computer could not identify the display, so there is no name to save a profile under.\n", err);
+		return EXIT_FAILED;
+	}
+	snprintf(profile.model, sizeof profile.model, "%s", info.model);
+	snprintf(profile.thunderbolt, sizeof profile.thunderbolt, "%s", info.thunderbolt);
+	profile.year = info.year;
+	profile.week = info.week;
+
+	fputs("Reading every code, then testing a few writes. This takes about half a minute.\n"
+	      "The picture may flicker. Every setting that is tested is put back.\n\n", out);
+	fflush(out);
+
+	// Read every code. `slot` is where a supported code sits in the profile, plus one.
+	uint16_t original[256];
+	int slot[256] = {0};
+	int answered = 0;
+	for (int code = 0; code <= 0xFF; code++) {
+		struct vcp_value value;
+		int result = vcp_get(t, (uint8_t)code, &value);
+		if (result >= 0) answered = 1;
+		if (result == 0) {
+			profile.codes[profile.count] = (struct profile_code){(uint8_t)code, value.maximum, WRITE_UNTESTED};
+			original[code] = value.current;
+			slot[code] = ++profile.count;
+		}
+		if (!answered && code >= 3) break;
+		t->pause(t->ctx, SCAN_GAP_MS);
+	}
+	if (!answered) {
+		fputs(NO_ANSWER, err);
+		return EXIT_FAILED;
+	}
+
+	size_t caps_length = 0;
+	if (read_caps(t, profile.caps, sizeof profile.caps - 1, &caps_length) != 0) caps_length = 0;
+	profile.caps[caps_length] = '\0';
+
+	// Test one control at a time. Its value is read again first, because an earlier test may
+	// have changed it: on some monitors a volume write switches mute off.
+	size_t count;
+	const struct control *controls = controls_all(&count);
+	for (size_t i = 0; i < count; i++) {
+		const struct control *control = &controls[i];
+		if (!slot[control->code] || (control->probe != PROBE_STEP && control->probe != PROBE_TOGGLE)) continue;
+		struct vcp_value now;
+		uint16_t target, after = 0;
+		if (vcp_get(t, control->code, &now) != 0 || test_target(control, &now, &target) != 0) continue;
+		int result = vcp_set(t, control->code, target, &after);
+		struct profile_code *entry = &profile.codes[slot[control->code] - 1];
+		if (result == 0) entry->write = WRITE_WORKS;
+		else if (result == 1 && after == now.current) entry->write = WRITE_IGNORED;
+		if (result >= 0 && after != original[control->code]) vcp_set(t, control->code, original[control->code], &after);
+	}
+
+	// Put back anything that is still different from where it started.
+	int left_changed = 0;
+	for (size_t i = 0; i < count; i++) {
+		const struct control *control = &controls[i];
+		if (!slot[control->code] || control->probe == PROBE_NONE) continue;
+		struct vcp_value now;
+		if (vcp_get(t, control->code, &now) != 0 || now.current == original[control->code]) continue;
+		uint16_t after = now.current;
+		if (vcp_set(t, control->code, original[control->code], &after) != 0) {
+			fprintf(err, "Could not put %s back to %u. It is now %u.\n", control->name, original[control->code], after);
+			left_changed = 1;
+		}
+	}
+
+	fprintf(out, "%-14s %s (%s)\n", "monitor", profile.model[0] ? profile.model : "unknown model", profile.id);
+	fprintf(out, "%-14s %d can be read\n", "codes", profile.count);
+	for (size_t i = 0; i < count; i++) {
+		static const char *RESULTS[] = {[WRITE_UNTESTED] = "writes not tested", [WRITE_WORKS] = "writes work", [WRITE_IGNORED] = "writes are ignored"};
+		int at = slot[controls[i].code];
+		fprintf(out, "%-14s %s\n", controls[i].name, at ? RESULTS[profile.codes[at - 1].write] : "not supported");
+	}
+
+	char text[16384], path[1024];
+	if (profile_format(&profile, text, sizeof text) < 0 || t->save(t->ctx, profile.id, text, path, sizeof path) != 0) {
+		fputs("The profile could not be saved.\n", err);
+		return EXIT_FAILED;
+	}
+	fprintf(out, "%-14s %s\n", "profile", path);
+	return left_changed ? EXIT_NOT_APPLIED : EXIT_OK;
+}
+
 int run_command(const struct command *cmd, const struct transport *t, FILE *out, FILE *err) {
 	switch (cmd->verb) {
 	case VERB_HELP:
@@ -298,6 +420,8 @@ int run_command(const struct command *cmd, const struct transport *t, FILE *out,
 		return run_info(t, out, err);
 	case VERB_TIMING:
 		return run_timing(t, out, err);
+	case VERB_SETUP:
+		return run_setup(t, out, err);
 	}
 	return EXIT_USAGE;
 }
