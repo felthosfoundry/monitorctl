@@ -333,6 +333,7 @@ static void control_line(FILE *out, const char *name, const struct profile_code 
 // side effect. No other code is written.
 // Unless --offline is given, it also asks the monitor database what other people found on the
 // same monitor. The answer is shown next to this monitor's results and changes nothing else.
+// At the end it offers to send the saved profile to the database, and sends it only on a yes.
 static int run_setup(const struct command *cmd, const struct transport *t, FILE *out, FILE *err) {
 	struct display_info info;
 	struct profile profile;
@@ -427,7 +428,7 @@ static int run_setup(const struct command *cmd, const struct transport *t, FILE 
 
 	fprintf(out, "%-14s %s (%s)\n", "monitor", profile.model[0] ? profile.model : "unknown model", profile.id);
 	if (database == FOUND) fprintf(out, "%-14s %u report%s for this monitor: " DATABASE_PAGE "%s\n", "database", known_reports, known_reports == 1 ? "" : "s", profile.id);
-	else if (database == NO_REPORTS) fprintf(out, "%-14s no reports for this monitor yet. To add yours, see " DATABASE_PAGE "\n", "database");
+	else if (database == NO_REPORTS) fprintf(out, "%-14s no reports for this monitor yet. Yours would be the first.\n", "database");
 	else if (database == UNREACHABLE) fprintf(out, "%-14s could not be reached\n", "database");
 	else if (database == UNREADABLE) fprintf(out, "%-14s sent an answer monitorctl could not read\n", "database");
 	else fprintf(out, "%-14s not asked, because of --offline\n", "database");
@@ -443,7 +444,27 @@ static int run_setup(const struct command *cmd, const struct transport *t, FILE 
 		return EXIT_FAILED;
 	}
 	fprintf(out, "%-14s %s\n", "profile", path);
-	return left_changed ? EXIT_NOT_APPLIED : EXIT_OK;
+	fflush(out);
+
+	// Offer to send the profile. The text that goes out is the text that was just saved.
+	int send_failed = 0;
+	if (!cmd->offline) {
+		int send = cmd->upload ? 1 : t->ask(t->ctx,
+			"\nSend this profile to the monitor database at felthosfoundry.com, so the next person\n"
+			"with this monitor knows what works? It is the file above, and it holds no serial number. [y/N] ");
+		if (send < 0) {
+			fputs("\nTo send this profile to the monitor database, run: monitorctl setup --upload\n", out);
+		} else if (send > 0) {
+			int sent = t->upload(t->ctx, text);
+			if (sent == 0) fprintf(out, "%-14s thank you. A person reads it before it appears on the site.\n", "sent");
+			else if (sent == 1) fprintf(out, "%-14s the database already has this report from you.\n", "sent");
+			else if (sent == -2) fputs("The database did not accept the profile.\n", err);
+			else fputs("The profile could not be sent. The database could not be reached, or it is not taking reports right now.\n", err);
+			send_failed = sent < 0;
+		}
+	}
+	if (left_changed) return EXIT_NOT_APPLIED;
+	return send_failed ? EXIT_FAILED : EXIT_OK;
 }
 
 int run_command(const struct command *cmd, const struct transport *t, FILE *out, FILE *err) {

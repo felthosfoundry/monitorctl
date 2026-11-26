@@ -10,7 +10,7 @@ HEADERS := $(wildcard src/*.h)
 
 all: build/monitorctl
 
-MAC := src/transport_mac.c src/info_mac.c src/lookup_curl.c
+MAC := src/transport_mac.c src/info_mac.c src/database_curl.c src/ask_tty.c
 
 build/monitorctl: $(CORE) $(MAC) src/main.c $(HEADERS)
 	@mkdir -p build

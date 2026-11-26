@@ -133,12 +133,13 @@ power          writes not tested
 profile        /Users/you/.config/monitorctl/SAM0F1E.txt
 ```
 
-It works in four steps:
+It works in five steps:
 
 1. It asks the monitor database what other people found on the same monitor.
 2. It reads every code from 0x00 to 0xFF and records the ones the monitor supports.
 3. It tests writes on brightness, contrast, volume, mute and the three colour gains. Each one moves by one step, is read back, and is put back. The picture may flicker, and a muted monitor may sound for a moment.
 4. It checks the colour preset and the picture mode, and puts them back if a test changed them as a side effect.
+5. It saves the profile, and then asks whether to send it to the monitor database.
 
 `setup` writes to nothing else. It never writes to `input` or `power`, because a monitor that changes input or switches off stops answering, and the old value could then not be put back. It never writes to a factory-reset code or a manufacturer-private code either. Those codes appear in the profile as `untested`.
 
@@ -151,13 +152,31 @@ The [monitor database](https://felthosfoundry.com/monitorctl/) holds what other 
 - **A control that `setup` does not test.** The line for `input` above says that the database found input writes are ignored on this monitor.
 - **A disagreement.** When your monitor and the database differ, the line says so, for example `writes work here, but are ignored in the database`.
 
-The request goes to `felthosfoundry.com` and carries the monitor's identifier, such as `SAM0F1E`, and nothing else. To skip it, add `--offline`:
+The lookup goes to `felthosfoundry.com` and carries the monitor's identifier, such as `SAM0F1E`, and nothing else. To skip it, add `--offline`:
 
 ```bash
 monitorctl setup --offline
 ```
 
 A database that cannot be reached is not an error. `setup` says so and carries on.
+
+### Sending your profile
+
+After the profile is saved, `setup` asks whether to send it to the database:
+
+```text
+Send this profile to the monitor database at felthosfoundry.com, so the next person
+with this monitor knows what works? It is the file above, and it holds no serial number. [y/N]
+```
+
+The default answer is no, and nothing is sent without a yes. On a yes, `setup` sends the saved file, byte for byte. You can read the file first, because its path is printed just above the question.
+
+- **What the site keeps.** It keeps the profile, the time it arrived, and a four-digit bucket derived from your network address. Tens of thousands of addresses share each bucket, so it tells senders apart well enough to count reports and cannot be turned back into an address. The address itself is not stored.
+- **Review.** A person reads every report before it appears on the site.
+- **Scripts.** When `setup` is not running in a terminal it does not ask, and it prints the command to use. `monitorctl setup --upload` sends without asking.
+- **Never.** `monitorctl setup --offline` does not look the monitor up, does not ask, and does not send.
+
+A send that fails is reported, and `setup` exits with code 1. The profile is saved all the same.
 
 The database only describes a monitor. Nothing it returns can make `monitorctl` write to a code, and it cannot unlock a write that needs `--force`. It is also kept out of your profile, so the profile stays a record of what your own monitor did.
 
@@ -178,7 +197,7 @@ code 0x60 max 3 write untested
 
 Each `code` line gives a code the monitor supports, the maximum the monitor reports for it, and what happened when `setup` tested a write: `works`, `ignored` or `untested`. A line for a fact that is not known is left out.
 
-The profile holds no serial number and none of your current settings. `setup` saves it under `~/.config/monitorctl/`, or under `$XDG_CONFIG_HOME/monitorctl/` when that is set. The profile itself is never sent anywhere. To add your monitor to the database, see the [project page](https://felthosfoundry.com/monitorctl/). The other commands do not read the profile yet.
+The profile holds no serial number and none of your current settings. `setup` saves it under `~/.config/monitorctl/`, or under `$XDG_CONFIG_HOME/monitorctl/` when that is set. The profile is sent only when you say yes to the question above, or pass `--upload`. The other commands do not read the profile yet.
 
 ## Writes are checked
 
@@ -208,7 +227,7 @@ pmset displaysleepnow
 | Code | Meaning |
 |---|---|
 | 0 | Done. |
-| 1 | The monitor did not answer, or does not support the code. |
+| 1 | The monitor did not answer, or does not support the code. For `setup`, a profile that was to be sent could not be. |
 | 2 | The command line was wrong. |
 | 3 | The monitor accepted a write and the value did not change, or `setup` could not put a setting back. |
 | 4 | The write is guarded and `--force` was not given. |
@@ -247,7 +266,8 @@ The tests need no monitor. They run every command against a pretend monitor that
 | `src/profile.c` | Building a monitor's identifier, and writing, reading and saving a profile. |
 | `src/transport_mac.c` | The only code that touches hardware. |
 | `src/info_mac.c` | Reading the model, resolution and Thunderbolt firmware from macOS. |
-| `src/lookup_curl.c` | Asking the monitor database for a record, by running the curl that ships with macOS. |
+| `src/database_curl.c` | Asking the monitor database for a record and sending it a profile, by running the curl that ships with macOS. |
+| `src/ask_tty.c` | Asking a yes-or-no question in the terminal. |
 
 ## Licence
 
