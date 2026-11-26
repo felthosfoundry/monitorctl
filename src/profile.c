@@ -128,10 +128,11 @@ int profile_save(void *ctx, const char *id, const char *text, char *path, size_t
 	(void)ctx;
 	if (size > 0) path[0] = '\0';
 
-	// The identifier becomes a file name, so it may hold only letters and digits.
-	if (!id[0]) return -1;
+	// The name becomes a file name, so it may hold only letters, digits and hyphens, and it
+	// starts with a letter or a digit.
+	if (!isalnum((unsigned char)id[0])) return -1;
 	for (const char *c = id; *c; c++)
-		if (!isalnum((unsigned char)*c)) return -1;
+		if (!isalnum((unsigned char)*c) && *c != '-') return -1;
 
 	char folder[900];
 	const char *config = getenv("XDG_CONFIG_HOME");

@@ -1,9 +1,14 @@
 // What setup saw when a monitor did not answer: a few traced attempts to read one setting, and
 // what they say about where the request was lost.
+// A problem report puts that next to what the computer knows about the display and itself. Like
+// a profile, it is plain text with one fact per line, and it holds no serial number.
 #ifndef PROBLEM_H
 #define PROBLEM_H
 
+#include <stddef.h>
 #include <stdint.h>
+
+struct display_info;
 
 // One attempt to read the brightness. Each step is tried only when the one before it worked.
 struct attempt {
@@ -26,5 +31,9 @@ enum cause {
 
 // Returns the cause, and writes to `*status` the operating system's code that goes with it, or 0.
 enum cause problem_cause(const struct attempt *attempts, int count, unsigned *status);
+
+// Writes a problem report for the monitor `id` as text. Returns the length, or -1 when `size` is
+// too small.
+int problem_format(const char *id, const struct display_info *info, const struct attempt *attempts, int count, char *text, size_t size);
 
 #endif
