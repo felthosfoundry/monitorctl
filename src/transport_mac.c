@@ -20,16 +20,27 @@ extern IOReturn IOAVServiceWriteI2C(IOAVServiceRef service, uint32_t chipAddress
 #define DDC_CHIP 0x37 // the I2C address every DDC/CI monitor listens on
 #define DDC_HOST 0x51 // the address a computer signs its requests with
 
+// macOS's answer to the last write or read. It is kept so that a failure can be reported with
+// its code, which tells a refused request apart from a monitor that stayed silent.
+static IOReturn last_result = kIOReturnSuccess;
+
 static int mac_write(void *ctx, const uint8_t *packet, size_t n) {
 	uint8_t copy[64];
 	if (n > sizeof copy) return -1;
 	memcpy(copy, packet, n);
-	return IOAVServiceWriteI2C((IOAVServiceRef)ctx, DDC_CHIP, DDC_HOST, copy, (uint32_t)n) == kIOReturnSuccess ? 0 : -1;
+	last_result = IOAVServiceWriteI2C((IOAVServiceRef)ctx, DDC_CHIP, DDC_HOST, copy, (uint32_t)n);
+	return last_result == kIOReturnSuccess ? 0 : -1;
 }
 
 static int mac_read(void *ctx, uint8_t *buffer, size_t n) {
 	memset(buffer, 0, n);
-	return IOAVServiceReadI2C((IOAVServiceRef)ctx, DDC_CHIP, DDC_HOST, buffer, (uint32_t)n) == kIOReturnSuccess ? 0 : -1;
+	last_result = IOAVServiceReadI2C((IOAVServiceRef)ctx, DDC_CHIP, DDC_HOST, buffer, (uint32_t)n);
+	return last_result == kIOReturnSuccess ? 0 : -1;
+}
+
+static unsigned mac_status(void *ctx) {
+	(void)ctx;
+	return (unsigned)last_result;
 }
 
 static void mac_pause(void *ctx, unsigned milliseconds) {
@@ -64,5 +75,6 @@ int transport_mac_open(struct transport *t) {
 	t->lookup = database_lookup;
 	t->ask = ask_tty;
 	t->upload = database_upload;
+	t->status = mac_status;
 	return 0;
 }

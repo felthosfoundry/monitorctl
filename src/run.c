@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "ddc.h"
+#include "problem.h"
 #include "profile.h"
 
 #define ATTEMPTS 4
@@ -244,8 +245,22 @@ static int run_info(const struct transport *t, FILE *out, FILE *err) {
 		fprintf(out, "%-14s %u x %u at %s Hz\n", "resolution", info.width, info.height, rate);
 	}
 
-	if (info.thunderbolt[0]) fprintf(out, "%-14s firmware %s\n", "thunderbolt", info.thunderbolt);
-	else fprintf(out, "%-14s not connected over Thunderbolt\n", "thunderbolt");
+	// The firmware is known only for a Thunderbolt device that carries the display's name. When
+	// devices are plugged in and none has that name, they are listed, so a monitor whose two
+	// names differ is not reported as absent.
+	if (info.thunderbolt[0]) {
+		fprintf(out, "%-14s firmware %s\n", "thunderbolt", info.thunderbolt);
+	} else if (info.device_count > 0) {
+		fprintf(out, "%-14s no Thunderbolt device is named %s. Attached:", "thunderbolt", info.model[0] ? info.model : "like this display");
+		for (int i = 0; i < info.device_count; i++) {
+			const struct attached_device *d = &info.devices[i];
+			fprintf(out, "%s %s %s", i ? "," : "", d->vendor, d->model);
+			if (d->firmware[0]) fprintf(out, " (firmware %s)", d->firmware);
+		}
+		fputc('\n', out);
+	} else {
+		fprintf(out, "%-14s not connected over Thunderbolt\n", "thunderbolt");
+	}
 
 	char caps[4096];
 	size_t length;
@@ -305,6 +320,66 @@ static int test_target(const struct control *control, const struct vcp_value *no
 }
 
 #define DATABASE_PAGE "https://felthosfoundry.com/monitorctl/"
+
+#define TRACE_ATTEMPTS 3
+#define TRACE_CODE 0x10 // brightness, which nearly every monitor supports
+
+// Tries a few times to read one setting, and records how far each try got. Nothing is written
+// to the monitor's settings.
+static void trace(const struct transport *t, struct attempt *attempts) {
+	memset(attempts, 0, TRACE_ATTEMPTS * sizeof *attempts);
+	for (int i = 0; i < TRACE_ATTEMPTS; i++) {
+		struct attempt *a = &attempts[i];
+		uint8_t packet[DDC_MAX_PACKET];
+		size_t n = ddc_get_request(TRACE_CODE, packet);
+		a->sent = t->write(t->ctx, packet, n) == 0;
+		a->send_status = t->status ? t->status(t->ctx) : 0;
+		if (a->sent) {
+			t->pause(t->ctx, REPLY_WAIT_MS);
+			a->read = t->read(t->ctx, a->reply, sizeof a->reply) == 0;
+			a->read_status = t->status ? t->status(t->ctx) : 0;
+			struct vcp_value value;
+			a->valid = a->read && ddc_parse_vcp_reply(a->reply, sizeof a->reply, TRACE_CODE, &value) >= 0;
+			if (!a->read) memset(a->reply, 0, sizeof a->reply);
+		}
+		t->pause(t->ctx, REPLY_WAIT_MS);
+	}
+}
+
+// Says where the request was lost, and what that usually means.
+static void explain(FILE *err, const struct attempt *attempts, const struct display_info *info, const char *name) {
+	unsigned status = 0;
+	enum cause cause = problem_cause(attempts, TRACE_ATTEMPTS, &status);
+	char code[40] = "";
+	if (status) snprintf(code, sizeof code, " (macOS error 0x%08X)", status);
+
+	fputs("The monitor did not answer.\n", err);
+	switch (cause) {
+	case CAUSE_NOT_SENT:
+		fprintf(err, "The Mac could not send the request%s.\n", code);
+		fputs("It may be off, asleep, or connected through a dock or adapter that does not carry DDC/CI.\n", err);
+		break;
+	case CAUSE_NOT_READ:
+		fprintf(err, "The Mac sent the request and could not read a reply%s.\n", code);
+		fputs("It may be off, asleep, or connected through a dock or adapter that does not carry DDC/CI.\n", err);
+		break;
+	case CAUSE_EMPTY:
+		fputs("The Mac read a reply each time, and every reply was empty.\n", err);
+		fputs("The monitor may be showing another input, or DDC/CI may be switched off in the monitor's menu.\n", err);
+		break;
+	case CAUSE_INVALID:
+		fputs("The monitor replied, and its replies were not valid DDC/CI.\n", err);
+		fputs("A dock or adapter between the Mac and the monitor can cause this.\n", err);
+		break;
+	case CAUSE_UNSTEADY:
+		fputs("It answered a later attempt, so its answers come and go. Run setup again.\n", err);
+		break;
+	}
+	if (info->displays > 1) {
+		fprintf(err, "The Mac sees %u external displays. monitorctl talks to one of them, and it may not be %s.\n", info->displays, name);
+		fprintf(err, "Unplug the other display%s and run setup again.\n", info->displays > 2 ? "s" : "");
+	}
+}
 
 // One line of setup's summary for a named control: what this monitor did, and what the database
 // says when that adds something. A database record only ever changes this wording.
@@ -387,7 +462,9 @@ static int run_setup(const struct command *cmd, const struct transport *t, FILE 
 		t->pause(t->ctx, SCAN_GAP_MS);
 	}
 	if (!answered) {
-		fputs(NO_ANSWER, err);
+		struct attempt attempts[TRACE_ATTEMPTS];
+		trace(t, attempts);
+		explain(err, attempts, &info, profile.model[0] ? profile.model : profile.id);
 		return EXIT_FAILED;
 	}
 

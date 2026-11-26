@@ -9,6 +9,13 @@
 
 #include "cli.h"
 
+// A Thunderbolt device plugged into the computer. A Thunderbolt monitor is one of these.
+struct attached_device {
+	char vendor[48];
+	char model[48];
+	char firmware[16]; // or "" when unknown
+};
+
 // Facts about the display that the computer knows without asking the monitor.
 struct display_info {
 	char model[64];         // the display's product name, or "" when unknown
@@ -19,6 +26,12 @@ struct display_info {
 	unsigned vendor;        // the manufacturer number from the display's EDID, or 0 when unknown
 	unsigned product;       // the product number from the display's EDID
 	unsigned year, week;    // when the display was built, or 0 when unknown
+	char computer[32];      // the computer's model, such as "Mac16,7", or ""
+	char system[32];        // the operating system's version, or ""
+	unsigned displays;      // how many external displays the computer sees
+	unsigned channels;      // how many external displays the computer offers a DDC/CI channel for
+	struct attached_device devices[4]; // the Thunderbolt devices plugged in
+	int device_count;
 };
 
 struct transport {
@@ -40,6 +53,9 @@ struct transport {
 	// already had this report, -2 when it refused the profile, and -1 when it could not be
 	// reached or is not taking reports.
 	int (*upload)(void *ctx, const char *text);
+	// The operating system's code for the last write or read: 0 for success, and otherwise a
+	// number that says why it failed. May be NULL when the transport has no such code.
+	unsigned (*status)(void *ctx);
 };
 
 // Exit codes.

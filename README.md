@@ -280,8 +280,9 @@ They also run `install.sh` against a tarball of the working tree, with an empty 
 | `src/cli.c` | Turning the command line into a command. |
 | `src/run.c` | Carrying out a command through a transport. |
 | `src/profile.c` | Building a monitor's identifier, and writing, reading and saving a profile. |
+| `src/problem.c` | Judging where a request was lost when a monitor does not answer. |
 | `src/transport_mac.c` | The only code that touches hardware. |
-| `src/info_mac.c` | Reading the model, resolution and Thunderbolt firmware from macOS. |
+| `src/info_mac.c` | Reading the model, resolution and Thunderbolt devices from macOS, and the facts that help when a monitor does not answer. |
 | `src/database_curl.c` | Asking the monitor database for a record and sending it a profile, by running the curl that ships with macOS. |
 | `src/ask_tty.c` | Asking a yes-or-no question in the terminal. |
 | `install.sh` | The install command: downloading the source, building it and copying the program into place. |

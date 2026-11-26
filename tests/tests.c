@@ -81,6 +81,10 @@ struct fake {
 	int upload_result;               // what the database says to an upload
 	int uploads;                     // how many profiles were sent
 	char uploaded[16384];            // the last profile sent
+	int no_reply;                    // requests go out, and reading the reply fails
+	int noise;                       // replies are bytes that are not DDC/CI
+	unsigned os_error;               // the operating system's code for a failed write or read
+	unsigned last_status;            // the code for the last write or read, 0 for success
 };
 
 static struct setting *fake_find(struct fake *f, uint8_t code) {
@@ -97,6 +101,7 @@ static uint8_t reply_checksum(const uint8_t *bytes, size_t n) {
 
 static int fake_write(void *ctx, const uint8_t *packet, size_t n) {
 	struct fake *f = ctx;
+	f->last_status = f->unreachable ? f->os_error : 0;
 	if (f->unreachable) return -1;
 	uint8_t sum = 0x6E ^ 0x51;
 	for (size_t i = 0; i + 1 < n; i++) sum ^= packet[i];
@@ -122,8 +127,13 @@ static int fake_write(void *ctx, const uint8_t *packet, size_t n) {
 
 static int fake_read(void *ctx, uint8_t *buffer, size_t n) {
 	struct fake *f = ctx;
-	if (f->unreachable) return -1;
+	f->last_status = f->unreachable || f->no_reply ? f->os_error : 0;
+	if (f->unreachable || f->no_reply) return -1;
 	memset(buffer, 0, n);
+	if (f->noise) {
+		memset(buffer, 0xA5, n);
+		return 0;
+	}
 	if (f->garbage_replies > 0) {
 		f->garbage_replies--;
 		return 0;
@@ -204,6 +214,11 @@ static int fake_upload(void *ctx, const char *text) {
 	return f->upload_result;
 }
 
+static unsigned fake_status(void *ctx) {
+	struct fake *f = ctx;
+	return f->last_status;
+}
+
 static struct fake samsung(void) {
 	struct fake f = {
 		.settings = {
@@ -219,7 +234,9 @@ static struct fake samsung(void) {
 		.count = 8,
 		.caps = "(prot(monitor)type(lcd)model(FALCON)cmds(01 02 03)vcp(10 12 14(01 04 05) 60(01 03) 62 8D))",
 		.info = {.model = "C34J79x", .width = 3440, .height = 1440, .refresh = 100.0, .thunderbolt = "61.2",
-			.vendor = 19501, .product = 3870, .year = 2022, .week = 44},
+			.vendor = 19501, .product = 3870, .year = 2022, .week = 44,
+			.computer = "Mac16,7", .system = "27.2.1", .displays = 1, .channels = 1},
+		.os_error = 0xE00002C0,
 		.timing = {.status = 0x03, .horizontal = 15090, .vertical = 10040},
 	};
 	return f;
@@ -246,7 +263,7 @@ static int run(struct fake *f, const char *line) {
 	size_t out_size = 0, err_size = 0;
 	FILE *out = open_memstream(&out_buffer, &out_size);
 	FILE *err = open_memstream(&err_buffer, &err_size);
-	struct transport t = {f, fake_write, fake_read, fake_pause, fake_info, fake_save, fake_lookup, fake_ask, fake_upload};
+	struct transport t = {f, fake_write, fake_read, fake_pause, fake_info, fake_save, fake_lookup, fake_ask, fake_upload, fake_status};
 	int code = run_command(&cmd, &t, out, err);
 	fclose(out);
 	fclose(err);
@@ -1206,6 +1223,85 @@ static void test_setup_failures(void) {
 	CHECK(fake_find(&full, 0x8D)->current == 2);
 }
 
+// When nothing answers, setup makes a few more attempts that only read, and says which part failed.
+static void test_setup_says_which_part_failed(void) {
+	struct fake off = samsung();
+	off.unreachable = 1;
+	CHECK(run(&off, "setup --offline") == EXIT_FAILED);
+	CHECK_HAS(err_text, "The monitor did not answer.\n");
+	CHECK_HAS(err_text, "The Mac could not send the request (macOS error 0xE00002C0).\n");
+	CHECK_HAS(err_text, "It may be off, asleep");
+	CHECK(strstr(err_text, "external displays") == NULL);
+	CHECK(off.sets == 0);
+
+	struct fake deaf = samsung();
+	deaf.no_reply = 1;
+	deaf.os_error = 0xE00002D6;
+	CHECK(run(&deaf, "setup --offline") == EXIT_FAILED);
+	CHECK_HAS(err_text, "The Mac sent the request and could not read a reply (macOS error 0xE00002D6).\n");
+	CHECK(deaf.sets == 0);
+
+	struct fake silent = samsung();
+	silent.garbage_replies = 1000000;
+	CHECK(run(&silent, "setup --offline") == EXIT_FAILED);
+	CHECK_HAS(err_text, "The Mac read a reply each time, and every reply was empty.\n");
+	CHECK_HAS(err_text, "DDC/CI may be switched off in the monitor's menu");
+	CHECK(silent.sets == 0);
+
+	struct fake noisy = samsung();
+	noisy.noise = 1;
+	CHECK(run(&noisy, "setup --offline") == EXIT_FAILED);
+	CHECK_HAS(err_text, "The monitor replied, and its replies were not valid DDC/CI.\n");
+	CHECK(noisy.sets == 0);
+
+	// With two external displays, the tool may be talking to the other one.
+	struct fake two = samsung();
+	two.unreachable = 1;
+	two.info.displays = 2;
+	CHECK(run(&two, "setup --offline") == EXIT_FAILED);
+	CHECK_HAS(err_text, "The Mac sees 2 external displays. monitorctl talks to one of them, and it may not be C34J79x.\n");
+	CHECK_HAS(err_text, "Unplug the other display and run setup again.");
+
+	// Sixteen bad replies fail the scan, and the next attempt then gets through.
+	struct fake unsteady = samsung();
+	unsteady.garbage_replies = 16;
+	CHECK(run(&unsteady, "setup --offline") == EXIT_FAILED);
+	CHECK_HAS(err_text, "It answered a later attempt, so its answers come and go. Run setup again.\n");
+	CHECK(unsteady.sets == 0 && unsteady.saves == 0);
+
+	// A transport that cannot report codes still gets the general message.
+	struct fake old = samsung();
+	old.unreachable = 1;
+	old.os_error = 0;
+	CHECK(run(&old, "setup --offline") == EXIT_FAILED);
+	CHECK_HAS(err_text, "The Mac could not send the request.\n");
+}
+
+// info lists the Thunderbolt devices it found when none carries the display's name.
+static void test_info_lists_thunderbolt_devices(void) {
+	struct fake f = samsung();
+	f.info.thunderbolt[0] = '\0';
+	CHECK(run(&f, "info") == EXIT_OK);
+	CHECK_HAS(out_text, "thunderbolt    not connected over Thunderbolt\n");
+
+	f.info.device_count = 1;
+	f.info.devices[0] = (struct attached_device){.vendor = "SAMSUNG", .model = "S34C65T", .firmware = "41.1"};
+	CHECK(run(&f, "info") == EXIT_OK);
+	CHECK_HAS(out_text, "thunderbolt    no Thunderbolt device is named C34J79x. Attached: SAMSUNG S34C65T (firmware 41.1)\n");
+
+	f.info.device_count = 2;
+	f.info.devices[1] = (struct attached_device){.vendor = "CalDigit, Inc.", .model = "TS4", .firmware = ""};
+	CHECK(run(&f, "info") == EXIT_OK);
+	CHECK_HAS(out_text, "Attached: SAMSUNG S34C65T (firmware 41.1), CalDigit, Inc. TS4\n");
+
+	// A device with the display's name is still shown as before.
+	struct fake named = samsung();
+	named.info.device_count = 1;
+	named.info.devices[0] = (struct attached_device){.vendor = "SAMSUNG", .model = "C34J79x", .firmware = "61.2"};
+	CHECK(run(&named, "info") == EXIT_OK);
+	CHECK_HAS(out_text, "thunderbolt    firmware 61.2\n");
+}
+
 static void test_setup_with_facts_missing(void) {
 	// A monitor that does not answer capability requests, on a cable that is not Thunderbolt.
 	struct fake f = samsung();
@@ -1471,6 +1567,8 @@ int main(void) {
 	test_setup_puts_back_side_effects();
 	test_setup_when_a_setting_cannot_be_put_back();
 	test_setup_failures();
+	test_setup_says_which_part_failed();
+	test_info_lists_thunderbolt_devices();
 	test_setup_with_facts_missing();
 	test_setup_shows_what_the_database_knows();
 	test_setup_database_wording();
