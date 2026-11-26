@@ -42,6 +42,7 @@ struct transport {
 	void (*pause)(void *ctx, unsigned milliseconds);
 	int (*info)(void *ctx, struct display_info *info);
 	// Stores a profile's text under the monitor's identifier and writes where it went to `path`.
+	// A problem report is stored the same way, under the identifier and "-problem".
 	int (*save)(void *ctx, const char *id, const char *text, char *path, size_t size);
 	// Asks the monitor database for the record of the monitor `id`. Returns 0 with the record in
 	// `text`, 1 when the database has no reports for it, and -1 when it could not be reached.
@@ -49,9 +50,9 @@ struct transport {
 	// Asks the person at the keyboard a yes-or-no question. Returns 1 for yes, 0 for no, and -1
 	// when there is nobody to ask, because the program is not running in a terminal.
 	int (*ask)(void *ctx, const char *question);
-	// Sends a profile to the monitor database. Returns 0 when the database took it, 1 when it
-	// already had this report, -2 when it refused the profile, and -1 when it could not be
-	// reached or is not taking reports.
+	// Sends a profile or a problem report to the monitor database. Returns 0 when the database
+	// took it, 1 when it already had this report, -2 when it refused the text, and -1 when it
+	// could not be reached or is not taking reports.
 	int (*upload)(void *ctx, const char *text);
 	// The operating system's code for the last write or read: 0 for success, and otherwise a
 	// number that says why it failed. May be NULL when the transport has no such code.

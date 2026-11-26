@@ -213,6 +213,48 @@ Each `code` line gives a code the monitor supports, the maximum the monitor repo
 
 The profile holds no serial number and none of your current settings. `setup` saves it under `~/.config/monitorctl/`, or under `$XDG_CONFIG_HOME/monitorctl/` when that is set. The profile is sent only when you say yes to the question above, or pass `--upload`. The other commands do not read the profile yet.
 
+### When the monitor does not answer
+
+Some monitors do not answer at all. `setup` then makes three more attempts that only read the brightness, and says where the request was lost:
+
+```text
+The monitor did not answer.
+The Mac sent the request and could not read a reply (macOS error 0xE00002D6).
+It may be off, asleep, or connected through a dock or adapter that does not carry DDC/CI.
+
+problem        /Users/you/.config/monitorctl/SAM74A3-problem.txt
+```
+
+It saves what it saw as a problem report next to the profiles, and asks whether to send it to the database. The rules are the same as for a profile: nothing is sent without a yes, `--upload` sends without asking, and `--offline` neither asks nor sends. `setup` exits with code 1 either way.
+
+```text
+monitorctl-problem 1
+id SAM74A3
+model S34C65xT
+built 2023 week 40
+computer Mac16,7
+system 27.2.1
+displays 1
+channels 1
+device SAMSUNG S34C65T firmware 41.1
+step scan
+cause not-read
+try 1 write 0x00000000 read 0xE00002D6
+try 2 write 0x00000000 read 0xE00002D6
+try 3 write 0x00000000 read 0xE00002D6
+```
+
+| Line | What it holds |
+|---|---|
+| `id`, `model`, `built`, `thunderbolt` | The same facts as in a profile. |
+| `computer`, `system` | The Mac's model and the macOS version. |
+| `displays`, `channels` | How many external displays the Mac sees, and for how many of them macOS offers a DDC/CI channel. |
+| `device` | A Thunderbolt device plugged into the Mac: its maker, its model and its firmware. This can include a dock or a drive. |
+| `cause` | Where the request was lost: `not-sent`, `not-read`, `empty`, `invalid` or `unsteady`. |
+| `try` | One attempt: the code macOS returned for the write and for the read, and the reply's bytes when there was one. |
+
+The report holds no serial number, no user name, no computer name and none of your settings.
+
 ## Writes are checked
 
 A monitor replies "accepted" to a write even when it then ignores it. So after every write, `monitorctl` reads the value back. When the value did not change, it says so and exits with code 3:
@@ -280,7 +322,7 @@ They also run `install.sh` against a tarball of the working tree, with an empty 
 | `src/cli.c` | Turning the command line into a command. |
 | `src/run.c` | Carrying out a command through a transport. |
 | `src/profile.c` | Building a monitor's identifier, and writing, reading and saving a profile. |
-| `src/problem.c` | Judging where a request was lost when a monitor does not answer. |
+| `src/problem.c` | Judging where a request was lost when a monitor does not answer, and writing a problem report. |
 | `src/transport_mac.c` | The only code that touches hardware. |
 | `src/info_mac.c` | Reading the model, resolution and Thunderbolt devices from macOS, and the facts that help when a monitor does not answer. |
 | `src/database_curl.c` | Asking the monitor database for a record and sending it a profile, by running the curl that ships with macOS. |

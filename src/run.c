@@ -402,6 +402,35 @@ static void control_line(FILE *out, const char *name, const struct profile_code 
 	fprintf(out, "%-14s %s%s\n", name, PLAIN[here->write], more);
 }
 
+// Saves what setup saw as a problem report, and offers to send it to the monitor database. The
+// text that goes out is the text that was saved, and it goes only on a yes or with --upload.
+static void report_problem(const struct command *cmd, const struct transport *t, const char *id, const struct display_info *info,
+	const struct attempt *attempts, FILE *out, FILE *err) {
+	char text[4096], name[32], path[1024];
+	snprintf(name, sizeof name, "%s-problem", id);
+	if (problem_format(id, info, attempts, TRACE_ATTEMPTS, text, sizeof text) < 0 || t->save(t->ctx, name, text, path, sizeof path) != 0) {
+		fputs("The problem report could not be saved.\n", err);
+		return;
+	}
+	fprintf(out, "\n%-14s %s\n", "problem", path);
+	fflush(out);
+	if (cmd->offline) return;
+
+	int send = cmd->upload ? 1 : t->ask(t->ctx,
+		"\nSend this problem report to felthosfoundry.com, so monitorctl can be made to work with\n"
+		"this monitor? It is the file above. It names the Mac's model and the Thunderbolt devices\n"
+		"plugged in, and it holds no serial number. [y/N] ");
+	if (send < 0) {
+		fputs("\nTo send this problem report, run: monitorctl setup --upload\n", out);
+	} else if (send > 0) {
+		int sent = t->upload(t->ctx, text);
+		if (sent == 0) fprintf(out, "%-14s thank you. A person reads every problem report.\n", "sent");
+		else if (sent == 1) fprintf(out, "%-14s the database already has this report from you.\n", "sent");
+		else if (sent == -2) fputs("The database did not accept the problem report.\n", err);
+		else fputs("The problem report could not be sent. The database could not be reached, or it is not taking reports right now.\n", err);
+	}
+}
+
 // Finds out what the monitor supports and saves the result as a profile.
 // It reads every code, then tests writes on the controls marked for it in controls.c. Each tested
 // control moves one step and is put back, and so is any watched control that a test changed as a
@@ -409,6 +438,8 @@ static void control_line(FILE *out, const char *name, const struct profile_code 
 // Unless --offline is given, it also asks the monitor database what other people found on the
 // same monitor. The answer is shown next to this monitor's results and changes nothing else.
 // At the end it offers to send the saved profile to the database, and sends it only on a yes.
+// When the monitor does not answer at all, it says where the request was lost, and saves and
+// offers a problem report in place of a profile.
 static int run_setup(const struct command *cmd, const struct transport *t, FILE *out, FILE *err) {
 	struct display_info info;
 	struct profile profile;
@@ -465,6 +496,7 @@ static int run_setup(const struct command *cmd, const struct transport *t, FILE 
 		struct attempt attempts[TRACE_ATTEMPTS];
 		trace(t, attempts);
 		explain(err, attempts, &info, profile.model[0] ? profile.model : profile.id);
+		report_problem(cmd, t, profile.id, &info, attempts, out, err);
 		return EXIT_FAILED;
 	}
 

@@ -27,8 +27,9 @@ const char *cli_usage(void) {
 	       "  --force   send a write that is refused by default: switching the monitor off,\n"
 	       "            restoring factory settings, or a manufacturer-private code.\n"
 	       "  --offline with setup, do not ask felthosfoundry.com what is known about the\n"
-	       "            monitor, and do not offer to send the profile.\n"
+	       "            monitor, and do not offer to send the profile or a problem report.\n"
 	       "  --upload  with setup, send the profile to felthosfoundry.com without asking first.\n"
+	       "            When the monitor does not answer, send the problem report instead.\n"
 	       "\n"
 	       "Exit codes: 0 done, 1 no answer or unsupported, 2 wrong usage,\n"
 	       "            3 the monitor ignored the write, 4 refused without --force.\n";

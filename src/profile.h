@@ -47,6 +47,7 @@ int profile_parse(const char *text, const char *id, struct profile *profile, uns
 
 // Saves a profile's text as <id>.txt in the monitorctl folder under XDG_CONFIG_HOME, or under
 // .config in the home folder. Writes the file's path to `path`. Returns 0 on success.
+// A problem report is saved the same way, with a name such as "SAM0F1E-problem".
 // `ctx` is unused. It is there so this function fits the transport's `save` slot.
 int profile_save(void *ctx, const char *id, const char *text, char *path, size_t size);
 

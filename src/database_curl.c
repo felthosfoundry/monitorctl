@@ -121,18 +121,20 @@ int database_lookup(void *ctx, const char *id, char *text, size_t size) {
 
 int database_upload(void *ctx, const char *text) {
 	(void)ctx;
+	// A profile and a problem report go to different addresses. The first line says which it is.
+	const char *url = strncmp(text, "monitorctl-problem ", 19) == 0 ? DATABASE_URL "/problems" : DATABASE_URL "/reports";
 	char *const arguments[] = {
 		COMMON, "--max-time", "10", "--max-filesize", "4096",
 		"--header", "Content-Type: text/plain; charset=utf-8",
 		// The site refuses a report without this header, which a web page cannot add.
 		"--header", "X-Monitorctl-Upload: 1",
-		"--data-binary", "@-", DATABASE_URL "/reports", NULL,
+		"--data-binary", "@-", (char *)url, NULL,
 	};
 	char reply[4096];
 	long code = 0;
 	if (run_curl(arguments, text, reply, sizeof reply, &code) != 0) return -1;
 	if (code == 201) return 0;
 	if (code == 200) return 1;
-	// 400 and 413 mean the profile itself was refused. Anything else is the site's own trouble.
+	// 400 and 413 mean the text itself was refused. Anything else is the site's own trouble.
 	return code == 400 || code == 413 ? -2 : -1;
 }

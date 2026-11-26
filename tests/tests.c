@@ -10,6 +10,7 @@
 #include "../src/cli.h"
 #include "../src/controls.h"
 #include "../src/ddc.h"
+#include "../src/problem.h"
 #include "../src/profile.h"
 #include "../src/run.h"
 
@@ -67,7 +68,7 @@ struct fake {
 	int wrote[256];                  // how many set requests arrived for each code
 	int volume_unmutes;              // like the Samsung: a volume write switches mute off
 	int gain_sets_preset;            // a colour gain write switches the colour preset to user1
-	char saved_id[16];               // the name the last profile was saved under
+	char saved_id[32];               // the name the last profile was saved under
 	char saved[16384];               // the text of the last saved profile
 	int saves;                       // how many profiles were saved
 	int save_fails;                  // the computer cannot save a profile
@@ -1011,6 +1012,13 @@ static void test_profile_save(void) {
 	// A name that could leave the folder is refused.
 	CHECK(profile_save(NULL, "../evil", "x\n", path, sizeof path) == -1);
 	CHECK(profile_save(NULL, "", "x\n", path, sizeof path) == -1);
+	CHECK(profile_save(NULL, "a/b", "x\n", path, sizeof path) == -1);
+	CHECK(profile_save(NULL, "a.b", "x\n", path, sizeof path) == -1);
+	CHECK(profile_save(NULL, "-problem", "x\n", path, sizeof path) == -1);
+	// A problem report is saved next to the profiles, under the identifier and "-problem".
+	CHECK(profile_save(NULL, "SAM0F1E-problem", "x\n", path, sizeof path) == 0);
+	CHECK(strstr(path, "/monitorctl/SAM0F1E-problem.txt") != NULL);
+	unlink(path);
 
 	// Without XDG_CONFIG_HOME, the folder is .config/monitorctl in the home folder.
 	unsetenv("XDG_CONFIG_HOME");
@@ -1199,7 +1207,7 @@ static void test_setup_failures(void) {
 	off.unreachable = 1;
 	CHECK(run(&off, "setup") == EXIT_FAILED);
 	CHECK_HAS(err_text, "did not answer");
-	CHECK(off.saves == 0);
+	CHECK(strstr(off.saved, "monitorctl-profile") == NULL);
 
 	// Without the manufacturer and product numbers there is no name to save under.
 	struct fake unknown = samsung();
@@ -1267,7 +1275,8 @@ static void test_setup_says_which_part_failed(void) {
 	unsteady.garbage_replies = 16;
 	CHECK(run(&unsteady, "setup --offline") == EXIT_FAILED);
 	CHECK_HAS(err_text, "It answered a later attempt, so its answers come and go. Run setup again.\n");
-	CHECK(unsteady.sets == 0 && unsteady.saves == 0);
+	CHECK(unsteady.sets == 0);
+	CHECK_HAS(unsteady.saved, "cause unsteady\n");
 
 	// A transport that cannot report codes still gets the general message.
 	struct fake old = samsung();
@@ -1275,6 +1284,138 @@ static void test_setup_says_which_part_failed(void) {
 	old.os_error = 0;
 	CHECK(run(&old, "setup --offline") == EXIT_FAILED);
 	CHECK_HAS(err_text, "The Mac could not send the request.\n");
+}
+
+static void test_problem_format(void) {
+	struct display_info info = {.model = "S34C65xT", .year = 2023, .week = 40, .thunderbolt = "",
+		.computer = "Mac16,7", .system = "27.2.1", .displays = 1, .channels = 1, .device_count = 2,
+		.devices = {{.vendor = "SAMSUNG", .model = "S34C65T", .firmware = "41.1"}, {.vendor = "CalDigit, Inc.", .model = "TS4"}}};
+	struct attempt attempts[3] = {
+		{.sent = 0, .send_status = 0xE00002C0},
+		{.sent = 1, .read = 0, .read_status = 0xE00002D6},
+		{.sent = 1, .read = 1, .reply = {0x6E, 0x88, 0x02, 0, 0x10}},
+	};
+	char text[4096];
+	int length = problem_format("SAM74A3", &info, attempts, 3, text, sizeof text);
+	CHECK_STR(text,
+		"monitorctl-problem 1\n"
+		"id SAM74A3\n"
+		"model S34C65xT\n"
+		"built 2023 week 40\n"
+		"computer Mac16,7\n"
+		"system 27.2.1\n"
+		"displays 1\n"
+		"channels 1\n"
+		"device SAMSUNG S34C65T firmware 41.1\n"
+		"device CalDigit, Inc. TS4\n"
+		"step scan\n"
+		"cause invalid\n"
+		"try 1 write 0xE00002C0\n"
+		"try 2 write 0x00000000 read 0xE00002D6\n"
+		"try 3 write 0x00000000 read 0x00000000 reply 6E8802001000000000000000\n");
+	CHECK(length == (int)strlen(text));
+	CHECK(problem_format("SAM74A3", &info, attempts, 3, text, 40) == -1);
+
+	// Facts the computer does not know are left out, and text from outside cannot start a line.
+	struct display_info bare = {.model = "Odd\nid EVIL", .thunderbolt = "61.2", .device_count = 1,
+		.devices = {{.vendor = "A\tB", .model = "C\rD"}}};
+	struct attempt none[1] = {{.sent = 0}};
+	CHECK(problem_format("SAM0F1E", &bare, none, 1, text, sizeof text) > 0);
+	CHECK_STR(text,
+		"monitorctl-problem 1\n"
+		"id SAM0F1E\n"
+		"model Odd id EVIL\n"
+		"thunderbolt 61.2\n"
+		"displays 0\n"
+		"channels 0\n"
+		"device A B C D\n"
+		"step scan\n"
+		"cause not-sent\n"
+		"try 1 write 0x00000000\n");
+}
+
+// When the monitor does not answer, setup saves what it saw and offers to send it.
+static void test_setup_saves_a_problem_report(void) {
+	struct fake off = samsung();
+	off.unreachable = 1;
+	off.answer = 0;
+	CHECK(run(&off, "setup") == EXIT_FAILED);
+	CHECK(off.saves == 1);
+	CHECK_STR(off.saved_id, "SAM0F1E-problem");
+	CHECK_HAS(off.saved, "monitorctl-problem 1\nid SAM0F1E\nmodel C34J79x\nbuilt 2022 week 44\nthunderbolt 61.2\ncomputer Mac16,7\nsystem 27.2.1\ndisplays 1\nchannels 1\nstep scan\ncause not-sent\n");
+	CHECK_HAS(off.saved, "try 1 write 0xE00002C0\ntry 2 write 0xE00002C0\ntry 3 write 0xE00002C0\n");
+	CHECK_HAS(out_text, "problem        /profiles/SAM0F1E-problem.txt\n");
+	CHECK(off.asks == 1);
+	CHECK_HAS(off.asked, "Send this problem report to felthosfoundry.com");
+	CHECK_HAS(off.asked, "Thunderbolt devices");
+	CHECK_HAS(off.asked, "no serial number");
+	CHECK(off.uploads == 0);
+	CHECK(off.sets == 0);
+
+	// A yes sends the text that was saved, and nothing else.
+	struct fake yes = samsung();
+	yes.unreachable = 1;
+	yes.answer = 1;
+	CHECK(run(&yes, "setup") == EXIT_FAILED);
+	CHECK(yes.uploads == 1);
+	CHECK_STR(yes.uploaded, yes.saved);
+	CHECK_HAS(out_text, "sent           thank you. A person reads every problem report.\n");
+
+	// --upload sends without asking, and --offline neither asks nor sends.
+	struct fake unasked = samsung();
+	unasked.unreachable = 1;
+	CHECK(run(&unasked, "setup --upload") == EXIT_FAILED);
+	CHECK(unasked.asks == 0 && unasked.uploads == 1);
+	CHECK_HAS(unasked.uploaded, "monitorctl-problem 1\n");
+
+	struct fake offline = samsung();
+	offline.unreachable = 1;
+	offline.answer = 1;
+	CHECK(run(&offline, "setup --offline") == EXIT_FAILED);
+	CHECK(offline.saves == 1 && offline.asks == 0 && offline.uploads == 0 && offline.lookups == 0);
+
+	// With nobody to ask, setup says how to send it.
+	struct fake piped = samsung();
+	piped.unreachable = 1;
+	piped.answer = -1;
+	CHECK(run(&piped, "setup") == EXIT_FAILED);
+	CHECK(piped.uploads == 0);
+	CHECK_HAS(out_text, "To send this problem report, run: monitorctl setup --upload\n");
+
+	// What the database answers.
+	struct fake known = samsung();
+	known.unreachable = 1;
+	known.answer = 1;
+	known.upload_result = 1;
+	CHECK(run(&known, "setup") == EXIT_FAILED);
+	CHECK_HAS(out_text, "sent           the database already has this report from you.\n");
+	struct fake refused = samsung();
+	refused.unreachable = 1;
+	refused.answer = 1;
+	refused.upload_result = -2;
+	CHECK(run(&refused, "setup") == EXIT_FAILED);
+	CHECK_HAS(err_text, "The database did not accept the problem report.\n");
+	struct fake down = samsung();
+	down.unreachable = 1;
+	down.answer = 1;
+	down.upload_result = -1;
+	CHECK(run(&down, "setup") == EXIT_FAILED);
+	CHECK_HAS(err_text, "The problem report could not be sent.");
+
+	// When the report cannot be saved, nothing is offered.
+	struct fake full = samsung();
+	full.unreachable = 1;
+	full.save_fails = 1;
+	full.answer = 1;
+	CHECK(run(&full, "setup") == EXIT_FAILED);
+	CHECK_HAS(err_text, "The problem report could not be saved.\n");
+	CHECK(full.asks == 0 && full.uploads == 0);
+
+	// A monitor that answers gets a profile and no problem report.
+	struct fake fine = samsung();
+	CHECK(run(&fine, "setup --offline") == EXIT_OK);
+	CHECK_STR(fine.saved_id, "SAM0F1E");
+	CHECK(fine.saves == 1);
 }
 
 // info lists the Thunderbolt devices it found when none carries the display's name.
@@ -1520,7 +1661,7 @@ static void test_setup_upload_outcomes(void) {
 	struct fake off = samsung();
 	off.unreachable = 1;
 	CHECK(run(&off, "setup --upload") == EXIT_FAILED);
-	CHECK(off.uploads == 0);
+	CHECK(strstr(off.uploaded, "monitorctl-profile") == NULL);
 }
 
 static void test_help(void) {
@@ -1568,6 +1709,8 @@ int main(void) {
 	test_setup_when_a_setting_cannot_be_put_back();
 	test_setup_failures();
 	test_setup_says_which_part_failed();
+	test_problem_format();
+	test_setup_saves_a_problem_report();
 	test_info_lists_thunderbolt_devices();
 	test_setup_with_facts_missing();
 	test_setup_shows_what_the_database_knows();
