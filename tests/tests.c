@@ -86,7 +86,18 @@ struct fake {
 	int noise;                       // replies are bytes that are not DDC/CI
 	unsigned os_error;               // the operating system's code for a failed write or read
 	unsigned last_status;            // the code for the last write or read, 0 for success
+	unsigned needs_wait;             // replies with a null message unless the wait was this long
+	int needs_twice;                 // replies with a null message unless the request came twice
+	int always_null;                 // replies with a null message whatever is done
+	int null_when_unsupported;       // replies with a null message for a code it does not support
+	unsigned last_pause;             // the length of the most recent pause
+	unsigned longest_wait;           // the longest pause that came just before a read
+	int repeats;                     // how many times in a row the pending request arrived
+	int doubled;                     // how many requests arrived twice in a row
 };
+
+// A null message: a valid DDC/CI reply that holds nothing, followed by whatever was on the wire.
+static const uint8_t NULL_MESSAGE[12] = {0x6E, 0x80, 0xBE, 0x4B, 0x14, 0x6D, 0x5B, 0xC6, 0xFA, 0x8E, 0xEB, 0x15};
 
 static struct setting *fake_find(struct fake *f, uint8_t code) {
 	for (int i = 0; i < f->count; i++)
@@ -107,6 +118,12 @@ static int fake_write(void *ctx, const uint8_t *packet, size_t n) {
 	uint8_t sum = 0x6E ^ 0x51;
 	for (size_t i = 0; i + 1 < n; i++) sum ^= packet[i];
 	if (n < 3 || packet[n - 1] != sum || (size_t)(packet[0] & 0x7F) != n - 2) f->bad_packets++;
+	if (n <= sizeof f->pending && memcmp(f->pending, packet, n) == 0 && f->repeats > 0) {
+		f->repeats++;
+		f->doubled++;
+	} else {
+		f->repeats = 1;
+	}
 	memset(f->pending, 0, sizeof f->pending);
 	memcpy(f->pending, packet, n);
 	if (packet[1] == 0x03) {
@@ -133,6 +150,14 @@ static int fake_read(void *ctx, uint8_t *buffer, size_t n) {
 	memset(buffer, 0, n);
 	if (f->noise) {
 		memset(buffer, 0xA5, n);
+		return 0;
+	}
+	int repeats = f->repeats;
+	f->repeats = 0;
+	if (f->last_pause > f->longest_wait) f->longest_wait = f->last_pause;
+	int unsupported = f->pending[1] == 0x01 && !fake_find(f, f->pending[2]);
+	if (f->always_null || f->last_pause < f->needs_wait || (f->needs_twice && repeats < 2) || (f->null_when_unsupported && unsupported)) {
+		memcpy(buffer, NULL_MESSAGE, n < sizeof NULL_MESSAGE ? n : sizeof NULL_MESSAGE);
 		return 0;
 	}
 	if (f->garbage_replies > 0) {
@@ -170,8 +195,8 @@ static int fake_read(void *ctx, uint8_t *buffer, size_t n) {
 }
 
 static void fake_pause(void *ctx, unsigned milliseconds) {
-	(void)ctx;
-	(void)milliseconds;
+	struct fake *f = ctx;
+	f->last_pause = milliseconds;
 }
 
 static int fake_info(void *ctx, struct display_info *info) {
@@ -1270,13 +1295,12 @@ static void test_setup_says_which_part_failed(void) {
 	CHECK_HAS(err_text, "The Mac sees 2 external displays. monitorctl talks to one of them, and it may not be C34J79x.\n");
 	CHECK_HAS(err_text, "Unplug the other display and run setup again.");
 
-	// Sixteen bad replies fail the scan, and the next attempt then gets through.
+	// Twenty bad replies fail the first four codes. The brightness then answers, so setup goes on.
 	struct fake unsteady = samsung();
-	unsteady.garbage_replies = 16;
-	CHECK(run(&unsteady, "setup --offline") == EXIT_FAILED);
-	CHECK_HAS(err_text, "It answered a later attempt, so its answers come and go. Run setup again.\n");
-	CHECK(unsteady.sets == 0);
-	CHECK_HAS(unsteady.saved, "cause unsteady\n");
+	unsteady.garbage_replies = 20;
+	CHECK(run(&unsteady, "setup --offline") == EXIT_OK);
+	CHECK_STR(unsteady.saved_id, "SAM0F1E");
+	CHECK_HAS(unsteady.saved, "code 0x10 max 100 write works\n");
 
 	// A transport that cannot report codes still gets the general message.
 	struct fake old = samsung();
@@ -1291,9 +1315,9 @@ static void test_problem_format(void) {
 		.computer = "Mac16,7", .system = "27.2.1", .displays = 1, .channels = 1, .device_count = 2,
 		.devices = {{.vendor = "SAMSUNG", .model = "S34C65T", .firmware = "41.1"}, {.vendor = "CalDigit, Inc.", .model = "TS4"}}};
 	struct attempt attempts[3] = {
-		{.sent = 0, .send_status = 0xE00002C0},
-		{.sent = 1, .read = 0, .read_status = 0xE00002D6},
-		{.sent = 1, .read = 1, .reply = {0x6E, 0x88, 0x02, 0, 0x10}},
+		{.wait_ms = 60, .sent = 0, .send_status = 0xE00002C0},
+		{.wait_ms = 60, .twice = 1, .sent = 1, .read = 0, .read_status = 0xE00002D6},
+		{.wait_ms = 250, .sent = 1, .read = 1, .reply = {0x6E, 0x88, 0x02, 0, 0x10}},
 	};
 	char text[4096];
 	int length = problem_format("SAM74A3", &info, attempts, 3, text, sizeof text);
@@ -1310,16 +1334,16 @@ static void test_problem_format(void) {
 		"device CalDigit, Inc. TS4\n"
 		"step scan\n"
 		"cause invalid\n"
-		"try 1 write 0xE00002C0\n"
-		"try 2 write 0x00000000 read 0xE00002D6\n"
-		"try 3 write 0x00000000 read 0x00000000 reply 6E8802001000000000000000\n");
+		"try 1 wait 60 write 0xE00002C0\n"
+		"try 2 wait 60 twice write 0x00000000 read 0xE00002D6\n"
+		"try 3 wait 250 write 0x00000000 read 0x00000000 reply 6E8802001000000000000000\n");
 	CHECK(length == (int)strlen(text));
 	CHECK(problem_format("SAM74A3", &info, attempts, 3, text, 40) == -1);
 
 	// Facts the computer does not know are left out, and text from outside cannot start a line.
 	struct display_info bare = {.model = "Odd\nid EVIL", .thunderbolt = "61.2", .device_count = 1,
 		.devices = {{.vendor = "A\tB", .model = "C\rD\xC3\xA9"}}};
-	struct attempt none[1] = {{.sent = 0}};
+	struct attempt none[1] = {{.wait_ms = 60, .sent = 0}};
 	CHECK(problem_format("SAM0F1E", &bare, none, 1, text, sizeof text) > 0);
 	CHECK_STR(text,
 		"monitorctl-problem 1\n"
@@ -1331,7 +1355,16 @@ static void test_problem_format(void) {
 		"device A B C D??\n"
 		"step scan\n"
 		"cause not-sent\n"
-		"try 1 write 0x00000000\n");
+		"try 1 wait 60 write 0x00000000\n");
+
+	// A null message is its own cause, and counts for more than bytes that mean nothing.
+	struct attempt nulls[2] = {
+		{.wait_ms = 60, .sent = 1, .read = 1, .reply = {0xA5, 0xA5, 0xA5}},
+		{.wait_ms = 60, .twice = 1, .sent = 1, .read = 1, .reply = {0x6E, 0x80, 0xBE, 0x4B, 0x14, 0x6D, 0x5B, 0xC6, 0xFA, 0x8E, 0xEB, 0x15}},
+	};
+	CHECK(problem_format("SAM74A3", &bare, nulls, 2, text, sizeof text) > 0);
+	CHECK_HAS(text, "cause null\ntry 1 wait 60 write 0x00000000 read 0x00000000 reply A5A5A5000000000000000000\n"
+		"try 2 wait 60 twice write 0x00000000 read 0x00000000 reply 6E80BE4B146D5BC6FA8EEB15\n");
 }
 
 // When the monitor does not answer, setup saves what it saw and offers to send it.
@@ -1343,7 +1376,8 @@ static void test_setup_saves_a_problem_report(void) {
 	CHECK(off.saves == 1);
 	CHECK_STR(off.saved_id, "SAM0F1E-problem");
 	CHECK_HAS(off.saved, "monitorctl-problem 1\nid SAM0F1E\nmodel C34J79x\nbuilt 2022 week 44\nthunderbolt 61.2\ncomputer Mac16,7\nsystem 27.2.1\ndisplays 1\nchannels 1\nstep scan\ncause not-sent\n");
-	CHECK_HAS(off.saved, "try 1 write 0xE00002C0\ntry 2 write 0xE00002C0\ntry 3 write 0xE00002C0\n");
+	CHECK_HAS(off.saved, "try 1 wait 60 write 0xE00002C0\ntry 2 wait 60 twice write 0xE00002C0\n"
+		"try 3 wait 250 write 0xE00002C0\ntry 4 wait 250 twice write 0xE00002C0\n");
 	CHECK_HAS(out_text, "problem        /profiles/SAM0F1E-problem.txt\n");
 	CHECK(off.asks == 1);
 	CHECK_HAS(off.asked, "Send this problem report to felthosfoundry.com");
@@ -1416,6 +1450,133 @@ static void test_setup_saves_a_problem_report(void) {
 	CHECK(run(&fine, "setup --offline") == EXIT_OK);
 	CHECK_STR(fine.saved_id, "SAM0F1E");
 	CHECK(fine.saves == 1);
+}
+
+static void test_null_reply(void) {
+	CHECK(ddc_is_null_reply(NULL_MESSAGE, sizeof NULL_MESSAGE) == 1);
+	uint8_t exact[3] = {0x6E, 0x80, 0xBE};
+	CHECK(ddc_is_null_reply(exact, 3) == 1);
+	CHECK(ddc_is_null_reply(exact, 2) == 0);
+	uint8_t zeros[12] = {0};
+	CHECK(ddc_is_null_reply(zeros, sizeof zeros) == 0);
+	uint8_t wrong_sum[3] = {0x6E, 0x80, 0xBF};
+	CHECK(ddc_is_null_reply(wrong_sum, 3) == 0);
+	uint8_t answer[11] = {0x6E, 0x88, 0x02, 0x00, 0x10, 0x00, 0x00, 0x64, 0x00, 0x5F, 0};
+	CHECK(ddc_is_null_reply(answer, sizeof answer) == 0);
+}
+
+// A monitor that works today is asked exactly as before: one request, a 60 ms wait.
+static void test_a_working_monitor_is_asked_as_before(void) {
+	struct fake f = samsung();
+	CHECK(run(&f, "list") == EXIT_OK);
+	CHECK(f.longest_wait == 60 && f.doubled == 0);
+	CHECK(run(&f, "caps") == EXIT_OK);
+	CHECK(run(&f, "timing") == EXIT_OK);
+	CHECK(f.longest_wait == 60 && f.doubled == 0);
+	struct fake g = samsung();
+	CHECK(run(&g, "setup --offline") == EXIT_OK);
+	CHECK(g.doubled == 0);
+	CHECK(strstr(out_text, "requests") == NULL);
+}
+
+// Some monitors answer with a null message until they are given more time, or the request twice.
+static void test_a_monitor_that_needs_another_method(void) {
+	struct fake slow = samsung();
+	slow.needs_wait = 200;
+	CHECK(run(&slow, "get brightness") == EXIT_OK);
+	CHECK_STR(out_text, "95\n");
+	CHECK(run(&slow, "set brightness 80") == EXIT_OK);
+	CHECK(fake_find(&slow, 0x10)->current == 80);
+	CHECK(run(&slow, "list") == EXIT_OK);
+	CHECK_HAS(out_text, "brightness     80 of 100\n");
+	CHECK(run(&slow, "caps") == EXIT_OK);
+	CHECK_HAS(out_text, "model(FALCON)");
+	CHECK(run(&slow, "timing") == EXIT_OK);
+	CHECK(run(&slow, "setup --offline") == EXIT_OK);
+	CHECK_HAS(out_text, "requests       answered after a 250 ms wait, not the usual 60 ms\n");
+	CHECK_HAS(slow.saved, "code 0x10 max 100 write works\n");
+	CHECK(fake_find(&slow, 0x10)->current == 80);
+
+	struct fake twice = samsung();
+	twice.needs_twice = 1;
+	CHECK(run(&twice, "get brightness") == EXIT_OK);
+	CHECK_STR(out_text, "95\n");
+	CHECK(run(&twice, "chg volume -5") == EXIT_OK);
+	CHECK(fake_find(&twice, 0x62)->current == 45);
+	CHECK(run(&twice, "setup --offline") == EXIT_OK);
+	CHECK_HAS(out_text, "requests       answered when each request was sent twice\n");
+	CHECK(twice.longest_wait == 60 || twice.longest_wait == 250);
+	CHECK_HAS(twice.saved, "code 0x62 max 100 write works\n");
+
+	struct fake both = samsung();
+	both.needs_wait = 200;
+	both.needs_twice = 1;
+	CHECK(run(&both, "setup --offline") == EXIT_OK);
+	CHECK_HAS(out_text, "requests       answered after a 250 ms wait, with each request sent twice\n");
+	CHECK_HAS(both.saved, "code 0x10 max 100 write works\n");
+	CHECK(fake_find(&both, 0x10)->current == 95);
+
+	// Once a method has worked, later requests in the same command start with it.
+	struct fake settled = samsung();
+	settled.needs_twice = 1;
+	CHECK(run(&settled, "list") == EXIT_OK);
+	CHECK(settled.longest_wait == 60);
+}
+
+// A monitor that only ever sends null messages gets its own explanation and cause.
+static void test_a_monitor_that_only_sends_null_messages(void) {
+	struct fake f = samsung();
+	f.always_null = 1;
+	f.answer = 0;
+	CHECK(run(&f, "setup") == EXIT_FAILED);
+	CHECK_HAS(err_text, "The monitor did not answer.\n");
+	CHECK_HAS(err_text, "It replied to every request with a DDC/CI null message, which means it had no answer ready.\n");
+	CHECK_HAS(err_text, "monitorctl also waited longer and sent each request twice, and neither helped.\n");
+	CHECK(strstr(err_text, "dock or adapter") == NULL);
+	CHECK_HAS(f.saved, "cause null\n"
+		"try 1 wait 60 write 0x00000000 read 0x00000000 reply 6E80BE4B146D5BC6FA8EEB15\n"
+		"try 2 wait 60 twice write 0x00000000 read 0x00000000 reply 6E80BE4B146D5BC6FA8EEB15\n"
+		"try 3 wait 250 write 0x00000000 read 0x00000000 reply 6E80BE4B146D5BC6FA8EEB15\n"
+		"try 4 wait 250 twice write 0x00000000 read 0x00000000 reply 6E80BE4B146D5BC6FA8EEB15\n");
+	CHECK(f.sets == 0);
+	CHECK(run(&f, "get brightness") == EXIT_FAILED);
+	CHECK_HAS(err_text, "did not answer");
+}
+
+// Some monitors send a null message for a code they do not support. The first four codes are
+// such codes on most monitors, so the brightness decides whether the monitor answers at all.
+static void test_null_messages_for_unsupported_codes(void) {
+	struct fake f = samsung();
+	f.null_when_unsupported = 1;
+	CHECK(run(&f, "setup --offline") == EXIT_OK);
+	CHECK_STR(f.saved_id, "SAM0F1E");
+	CHECK_HAS(out_text, "codes          8 can be read\n");
+	CHECK(strstr(out_text, "requests") == NULL);
+	CHECK(run(&f, "scan") == EXIT_OK);
+	CHECK_HAS(out_text, "0x10  current=95");
+	CHECK(run(&f, "list") == EXIT_OK);
+	CHECK_HAS(out_text, "brightness     95 of 100\n");
+	CHECK_HAS(out_text, "red            not supported\n");
+	CHECK(run(&f, "get red") == EXIT_FAILED);
+
+	// A monitor that only ever sends null messages has answered nothing, so it is not read this way.
+	struct fake dead = samsung();
+	dead.always_null = 1;
+	CHECK(run(&dead, "list") == EXIT_FAILED);
+	CHECK_HAS(err_text, "did not answer");
+}
+
+// One bad reply at the start is retried the usual way. It does not change how the monitor is asked.
+static void test_one_bad_reply_does_not_change_the_method(void) {
+	struct fake f = samsung();
+	f.garbage_replies = 1;
+	CHECK(run(&f, "setup --offline") == EXIT_OK);
+	CHECK(f.doubled == 0 && f.longest_wait <= 250);
+	CHECK(strstr(out_text, "requests") == NULL);
+	struct fake g = samsung();
+	g.garbage_replies = 1;
+	CHECK(run(&g, "list") == EXIT_OK);
+	CHECK(g.doubled == 0 && g.longest_wait == 60);
 }
 
 // info lists the Thunderbolt devices it found when none carries the display's name.
@@ -1710,6 +1871,12 @@ int main(void) {
 	test_setup_failures();
 	test_setup_says_which_part_failed();
 	test_problem_format();
+	test_null_reply();
+	test_a_working_monitor_is_asked_as_before();
+	test_a_monitor_that_needs_another_method();
+	test_a_monitor_that_only_sends_null_messages();
+	test_null_messages_for_unsupported_codes();
+	test_one_bad_reply_does_not_change_the_method();
 	test_setup_saves_a_problem_report();
 	test_info_lists_thunderbolt_devices();
 	test_setup_with_facts_missing();

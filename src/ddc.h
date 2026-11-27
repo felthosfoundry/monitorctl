@@ -44,6 +44,11 @@ int ddc_parse_vcp_reply(const uint8_t *reply, size_t len, uint8_t code, struct v
 // Returns -1 when the bytes are not a valid reply for this offset.
 int ddc_parse_caps_reply(const uint8_t *reply, size_t len, uint16_t offset, const uint8_t **text);
 
+// Says whether a reply is a null message: a valid DDC/CI reply of length zero. A monitor sends
+// one when it has no answer ready for the request it just received. Bytes after the first
+// three are whatever was on the wire, and are ignored. Returns 1 or 0.
+int ddc_is_null_reply(const uint8_t *reply, size_t len);
+
 // Reads the reply to a timing request.
 // Returns 0 and fills `out` on success, and -1 when the bytes are not a valid timing reply.
 int ddc_parse_timing_reply(const uint8_t *reply, size_t len, struct timing *out);

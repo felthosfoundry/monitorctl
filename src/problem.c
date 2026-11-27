@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdio.h>
 
+#include "ddc.h"
 #include "run.h"
 
 static int is_empty(const struct attempt *attempt) {
@@ -13,14 +14,14 @@ static int is_empty(const struct attempt *attempt) {
 	return 1;
 }
 
-// The furthest any attempt got decides the cause: one valid answer outweighs three silences.
+// The furthest any attempt got decides the cause: one null message outweighs three silences.
 enum cause problem_cause(const struct attempt *attempts, int count, unsigned *status) {
 	enum cause cause = CAUSE_NOT_SENT;
 	*status = 0;
 	for (int i = 0; i < count; i++) {
 		const struct attempt *a = &attempts[i];
 		enum cause this = CAUSE_NOT_SENT;
-		if (a->valid) this = CAUSE_UNSTEADY;
+		if (a->read && ddc_is_null_reply(a->reply, sizeof a->reply)) this = CAUSE_NULL;
 		else if (a->read) this = is_empty(a) ? CAUSE_EMPTY : CAUSE_INVALID;
 		else if (a->sent) this = CAUSE_NOT_READ;
 
@@ -59,7 +60,7 @@ static void append_fact(char *text, size_t size, size_t *used, const char *key, 
 
 int problem_format(const char *id, const struct display_info *info, const struct attempt *attempts, int count, char *text, size_t size) {
 	static const char *CAUSES[] = {[CAUSE_NOT_SENT] = "not-sent", [CAUSE_NOT_READ] = "not-read", [CAUSE_EMPTY] = "empty",
-		[CAUSE_INVALID] = "invalid", [CAUSE_UNSTEADY] = "unsteady"};
+		[CAUSE_INVALID] = "invalid", [CAUSE_NULL] = "null"};
 	size_t used = 0;
 	append(text, size, &used, "monitorctl-problem 1\n");
 	append_fact(text, size, &used, "id", id);
@@ -91,7 +92,7 @@ int problem_format(const char *id, const struct display_info *info, const struct
 	append(text, size, &used, "cause %s\n", CAUSES[problem_cause(attempts, count, &status)]);
 	for (int i = 0; i < count; i++) {
 		const struct attempt *a = &attempts[i];
-		append(text, size, &used, "try %d write 0x%08X", i + 1, a->send_status);
+		append(text, size, &used, "try %d wait %u%s write 0x%08X", i + 1, a->wait_ms, a->twice ? " twice" : "", a->send_status);
 		if (a->sent) append(text, size, &used, " read 0x%08X", a->read_status);
 		if (a->sent && a->read) {
 			append(text, size, &used, " reply ");
