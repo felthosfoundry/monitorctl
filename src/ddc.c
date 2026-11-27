@@ -91,3 +91,9 @@ int ddc_parse_timing_reply(const uint8_t *reply, size_t len, struct timing *out)
 	out->vertical = (uint16_t)(reply[6] << 8 | reply[7]);
 	return 0;
 }
+
+// A null message is the display's address, a length byte that says "no data", and the checksum:
+//   6E 80 BE
+int ddc_is_null_reply(const uint8_t *reply, size_t len) {
+	return len >= 3 && reply[0] == DISPLAY_ADDRESS && reply[1] == 0x80 && reply[2] == reply_sum(reply, 2);
+}

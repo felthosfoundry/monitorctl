@@ -8,23 +8,89 @@
 
 #define ATTEMPTS 4
 #define REPLY_WAIT_MS 60  // a monitor needs a moment between a request and its reply
-#define SETTLE_MS 250     // and a moment to apply a write before it reports the new value
+#define LONG_WAIT_MS 250  // and some monitors need a longer one
+#define RESEND_GAP_MS 10  // the gap between the two copies of a request that is sent twice
+#define SETTLE_MS 250     // a monitor needs a moment to apply a write before it reports the new value
 #define SCAN_GAP_MS 20
+#define PROBE_CODE 0x10   // brightness, which nearly every monitor supports
+
+// How a request is made: how long to wait for the reply, and whether to send the request twice.
+// Most monitors answer a single request after the usual wait. Some answer with a null message
+// until they are given more time or the request a second time.
+struct method {
+	unsigned wait_ms;
+	int twice;
+};
+
+// While no request has been answered, each attempt at a request uses the next of these. The
+// first two are the usual method, so a monitor that works today is asked exactly as before, and
+// one bad reply at the start does not change how it is asked.
+#define RUNGS 5
+static const struct method LADDER[RUNGS] = {
+	{REPLY_WAIT_MS, 0},
+	{REPLY_WAIT_MS, 0},
+	{REPLY_WAIT_MS, 1},
+	{LONG_WAIT_MS, 0},
+	{LONG_WAIT_MS, 1},
+};
+
+// The first method that gets a valid reply is used for the rest of the command.
+static struct method settled;
+static int is_settled;
+
+static struct method method_for(int attempt) {
+	return is_settled ? settled : LADDER[attempt];
+}
+
+// How many attempts a request gets: one for each rung until a method is settled, and the
+// usual number after that.
+static int attempts_allowed(void) {
+	return is_settled ? ATTEMPTS : RUNGS;
+}
+
+static void settle(struct method method) {
+	if (is_settled) return;
+	settled = method;
+	is_settled = 1;
+}
+
+// Sends a request the way `method` says. Returns 0 when it went out.
+static int send(const struct transport *t, struct method method, const uint8_t *packet, size_t n) {
+	if (t->write(t->ctx, packet, n) != 0) return -1;
+	if (!method.twice) return 0;
+	t->pause(t->ctx, RESEND_GAP_MS);
+	return t->write(t->ctx, packet, n);
+}
+
+// Sends a request, waits, and reads the reply. Returns 0 when a reply was read.
+static int exchange(const struct transport *t, struct method method, const uint8_t *packet, size_t n, uint8_t *reply, size_t size) {
+	if (send(t, method, packet, n) != 0) return -1;
+	t->pause(t->ctx, method.wait_ms);
+	return t->read(t->ctx, reply, size);
+}
 
 static const char *NO_ANSWER =
 	"The monitor did not answer. It may be off, asleep, showing another input, or not support DDC/CI.\n";
 
 // Reads one code. Returns 0 on success, 1 when the monitor does not support it, -1 on no valid reply.
+// Some monitors say "not supported" with a null message. A monitor that has already answered
+// another request in this command, and now sends two null messages in a row, is taken to mean that.
 static int vcp_get(const struct transport *t, uint8_t code, struct vcp_value *value) {
-	for (int attempt = 0; attempt < ATTEMPTS; attempt++) {
+	int was_settled = is_settled, nulls = 0;
+	for (int attempt = 0; attempt < attempts_allowed(); attempt++) {
 		uint8_t packet[DDC_MAX_PACKET], reply[12];
 		size_t n = ddc_get_request(code, packet);
-		if (t->write(t->ctx, packet, n) == 0) {
-			t->pause(t->ctx, REPLY_WAIT_MS);
-			if (t->read(t->ctx, reply, sizeof reply) == 0) {
-				int result = ddc_parse_vcp_reply(reply, sizeof reply, code, value);
-				if (result >= 0) return result;
+		struct method method = method_for(attempt);
+		if (exchange(t, method, packet, n, reply, sizeof reply) == 0) {
+			int result = ddc_parse_vcp_reply(reply, sizeof reply, code, value);
+			if (result >= 0) {
+				settle(method);
+				return result;
 			}
+			nulls = ddc_is_null_reply(reply, sizeof reply) ? nulls + 1 : 0;
+			if (was_settled && nulls == 2) return 1;
+		} else {
+			nulls = 0;
 		}
 		t->pause(t->ctx, REPLY_WAIT_MS);
 	}
@@ -65,7 +131,8 @@ static int refuse_if_guarded(const struct command *cmd, uint16_t value, FILE *er
 static int vcp_set(const struct transport *t, uint8_t code, uint16_t value, uint16_t *now) {
 	uint8_t packet[DDC_MAX_PACKET];
 	size_t n = ddc_set_request(code, value, packet);
-	if (t->write(t->ctx, packet, n) != 0) return -1;
+	// A write is always read first, so by now the method that this monitor answers is known.
+	if (send(t, method_for(0), packet, n) != 0) return -1;
 
 	// A monitor answers "accepted" to writes it then ignores, so only a read shows what happened.
 	// Some settings take a moment to change, so a mismatch is checked a second time.
@@ -165,8 +232,13 @@ static int run_scan(const struct transport *t, FILE *out, FILE *err) {
 			const struct control *control = control_for_code((uint8_t)code);
 			fprintf(out, "0x%02X  current=%-6u max=%-6u %s\n", code, value.current, value.maximum, control ? control->name : "");
 		}
-		// A monitor that never answers the first few codes will not answer the rest.
-		if (!answered && code >= 3) break;
+		// A monitor that answers neither the first few codes nor the brightness will not answer
+		// the rest. The brightness is asked because some monitors stay silent for a code they do
+		// not support, and the first few codes are such codes on most monitors.
+		if (!answered && code >= 3) {
+			if (vcp_get(t, PROBE_CODE, &value) < 0) break;
+			answered = 1;
+		}
 		t->pause(t->ctx, SCAN_GAP_MS);
 	}
 	if (!answered) {
@@ -185,13 +257,12 @@ static int read_caps(const struct transport *t, char *text, size_t size, size_t 
 		int got = -1;
 		const uint8_t *fragment = NULL;
 		uint8_t reply[DDC_MAX_PACKET];
-		for (int attempt = 0; attempt < ATTEMPTS && got < 0; attempt++) {
+		for (int attempt = 0; attempt < attempts_allowed() && got < 0; attempt++) {
 			uint8_t packet[DDC_MAX_PACKET];
 			size_t n = ddc_caps_request((uint16_t)*length, packet);
-			if (t->write(t->ctx, packet, n) == 0) {
-				t->pause(t->ctx, REPLY_WAIT_MS);
-				if (t->read(t->ctx, reply, sizeof reply) == 0) got = ddc_parse_caps_reply(reply, sizeof reply, (uint16_t)*length, &fragment);
-			}
+			struct method method = method_for(attempt);
+			if (exchange(t, method, packet, n, reply, sizeof reply) == 0) got = ddc_parse_caps_reply(reply, sizeof reply, (uint16_t)*length, &fragment);
+			if (got >= 0) settle(method);
 			t->pause(t->ctx, REPLY_WAIT_MS);
 		}
 		if (got < 0) return *length == 0 ? -1 : -2;
@@ -273,13 +344,12 @@ static int run_info(const struct transport *t, FILE *out, FILE *err) {
 static int run_timing(const struct transport *t, FILE *out, FILE *err) {
 	struct timing timing;
 	int got = -1;
-	for (int attempt = 0; attempt < ATTEMPTS && got != 0; attempt++) {
+	for (int attempt = 0; attempt < attempts_allowed() && got != 0; attempt++) {
 		uint8_t packet[DDC_MAX_PACKET], reply[12];
 		size_t n = ddc_timing_request(packet);
-		if (t->write(t->ctx, packet, n) == 0) {
-			t->pause(t->ctx, REPLY_WAIT_MS);
-			if (t->read(t->ctx, reply, sizeof reply) == 0) got = ddc_parse_timing_reply(reply, sizeof reply, &timing);
-		}
+		struct method method = method_for(attempt);
+		if (exchange(t, method, packet, n, reply, sizeof reply) == 0) got = ddc_parse_timing_reply(reply, sizeof reply, &timing);
+		if (got == 0) settle(method);
 		t->pause(t->ctx, REPLY_WAIT_MS);
 	}
 	if (got != 0) {
@@ -321,35 +391,46 @@ static int test_target(const struct control *control, const struct vcp_value *no
 
 #define DATABASE_PAGE "https://felthosfoundry.com/monitorctl/"
 
-#define TRACE_ATTEMPTS 3
-#define TRACE_CODE 0x10 // brightness, which nearly every monitor supports
+#define TRACE_ATTEMPTS (RUNGS - 1) // one for each different method
 
-// Tries a few times to read one setting, and records how far each try got. Nothing is written
-// to the monitor's settings.
-static void trace(const struct transport *t, struct attempt *attempts) {
+// Tries to read the brightness once with each method, and records how far each try got. Nothing
+// is written to the monitor's settings. It stops at the first valid answer, and that method is
+// then used for the rest of the command. Returns how many tries were made, and sets `*answered`
+// when the last of them got a valid answer.
+static int trace(const struct transport *t, struct attempt *attempts, int *answered) {
 	memset(attempts, 0, TRACE_ATTEMPTS * sizeof *attempts);
-	for (int i = 0; i < TRACE_ATTEMPTS; i++) {
-		struct attempt *a = &attempts[i];
+	*answered = 0;
+	int tries = 0;
+	while (tries < TRACE_ATTEMPTS && !*answered) {
+		struct method method = LADDER[tries + 1]; // the first two rungs are the same method
+		struct attempt *a = &attempts[tries++];
+		a->wait_ms = method.wait_ms;
+		a->twice = method.twice;
 		uint8_t packet[DDC_MAX_PACKET];
-		size_t n = ddc_get_request(TRACE_CODE, packet);
-		a->sent = t->write(t->ctx, packet, n) == 0;
+		size_t n = ddc_get_request(PROBE_CODE, packet);
+		a->sent = send(t, method, packet, n) == 0;
 		a->send_status = t->status ? t->status(t->ctx) : 0;
 		if (a->sent) {
-			t->pause(t->ctx, REPLY_WAIT_MS);
+			t->pause(t->ctx, method.wait_ms);
 			a->read = t->read(t->ctx, a->reply, sizeof a->reply) == 0;
 			a->read_status = t->status ? t->status(t->ctx) : 0;
 			struct vcp_value value;
-			a->valid = a->read && ddc_parse_vcp_reply(a->reply, sizeof a->reply, TRACE_CODE, &value) >= 0;
+			a->valid = a->read && ddc_parse_vcp_reply(a->reply, sizeof a->reply, PROBE_CODE, &value) >= 0;
 			if (!a->read) memset(a->reply, 0, sizeof a->reply);
+			if (a->valid) {
+				settle(method);
+				*answered = 1;
+			}
 		}
 		t->pause(t->ctx, REPLY_WAIT_MS);
 	}
+	return tries;
 }
 
 // Says where the request was lost, and what that usually means.
-static void explain(FILE *err, const struct attempt *attempts, const struct display_info *info, const char *name) {
+static void explain(FILE *err, const struct attempt *attempts, int tries, const struct display_info *info, const char *name) {
 	unsigned status = 0;
-	enum cause cause = problem_cause(attempts, TRACE_ATTEMPTS, &status);
+	enum cause cause = problem_cause(attempts, tries, &status);
 	char code[40] = "";
 	if (status) snprintf(code, sizeof code, " (macOS error 0x%08X)", status);
 
@@ -371,8 +452,10 @@ static void explain(FILE *err, const struct attempt *attempts, const struct disp
 		fputs("The monitor replied, and its replies were not valid DDC/CI.\n", err);
 		fputs("A dock or adapter between the Mac and the monitor can cause this.\n", err);
 		break;
-	case CAUSE_UNSTEADY:
-		fputs("It answered a later attempt, so its answers come and go. Run setup again.\n", err);
+	case CAUSE_NULL:
+		fputs("It replied to every request with a DDC/CI null message, which means it had no answer ready.\n", err);
+		fputs("monitorctl also waited longer and sent each request twice, and neither helped.\n", err);
+		fputs("DDC/CI may be switched off in the monitor's menu, or the monitor may not offer it on this input.\n", err);
 		break;
 	}
 	if (info->displays > 1) {
@@ -405,10 +488,10 @@ static void control_line(FILE *out, const char *name, const struct profile_code 
 // Saves what setup saw as a problem report, and offers to send it to the monitor database. The
 // text that goes out is the text that was saved, and it goes only on a yes or with --upload.
 static void report_problem(const struct command *cmd, const struct transport *t, const char *id, const struct display_info *info,
-	const struct attempt *attempts, FILE *out, FILE *err) {
+	const struct attempt *attempts, int tries, FILE *out, FILE *err) {
 	char text[4096], name[32], path[1024];
 	snprintf(name, sizeof name, "%s-problem", id);
-	if (problem_format(id, info, attempts, TRACE_ATTEMPTS, text, sizeof text) < 0 || t->save(t->ctx, name, text, path, sizeof path) != 0) {
+	if (problem_format(id, info, attempts, tries, text, sizeof text) < 0 || t->save(t->ctx, name, text, path, sizeof path) != 0) {
 		fputs("The problem report could not be saved.\n", err);
 		return;
 	}
@@ -489,15 +572,19 @@ static int run_setup(const struct command *cmd, const struct transport *t, FILE 
 			original[code] = value.current;
 			slot[code] = ++profile.count;
 		}
-		if (!answered && code >= 3) break;
+		// When the first few codes get no answer, the brightness decides. Some monitors stay
+		// silent for a code they do not support, and the first few are such codes on most
+		// monitors. Each method is tried on the brightness, and every try is recorded.
+		if (!answered && code >= 3) {
+			struct attempt attempts[TRACE_ATTEMPTS];
+			int tries = trace(t, attempts, &answered);
+			if (!answered) {
+				explain(err, attempts, tries, &info, profile.model[0] ? profile.model : profile.id);
+				report_problem(cmd, t, profile.id, &info, attempts, tries, out, err);
+				return EXIT_FAILED;
+			}
+		}
 		t->pause(t->ctx, SCAN_GAP_MS);
-	}
-	if (!answered) {
-		struct attempt attempts[TRACE_ATTEMPTS];
-		trace(t, attempts);
-		explain(err, attempts, &info, profile.model[0] ? profile.model : profile.id);
-		report_problem(cmd, t, profile.id, &info, attempts, out, err);
-		return EXIT_FAILED;
 	}
 
 	size_t caps_length = 0;
@@ -541,6 +628,10 @@ static int run_setup(const struct command *cmd, const struct transport *t, FILE 
 	else if (database == UNREACHABLE) fprintf(out, "%-14s could not be reached\n", "database");
 	else if (database == UNREADABLE) fprintf(out, "%-14s sent an answer monitorctl could not read\n", "database");
 	else fprintf(out, "%-14s not asked, because of --offline\n", "database");
+	// Say so when this monitor is not asked in the usual way, because it explains a slower run.
+	if (settled.wait_ms != REPLY_WAIT_MS && settled.twice) fprintf(out, "%-14s answered after a %u ms wait, with each request sent twice\n", "requests", settled.wait_ms);
+	else if (settled.wait_ms != REPLY_WAIT_MS) fprintf(out, "%-14s answered after a %u ms wait, not the usual %u ms\n", "requests", settled.wait_ms, (unsigned)REPLY_WAIT_MS);
+	else if (settled.twice) fprintf(out, "%-14s answered when each request was sent twice\n", "requests");
 	fprintf(out, "%-14s %d can be read\n", "codes", profile.count);
 	for (size_t i = 0; i < count; i++) {
 		int here = slot[controls[i].code], there = known_slot[controls[i].code];
@@ -577,6 +668,9 @@ static int run_setup(const struct command *cmd, const struct transport *t, FILE 
 }
 
 int run_command(const struct command *cmd, const struct transport *t, FILE *out, FILE *err) {
+	// Each command finds out afresh how the monitor wants to be asked.
+	is_settled = 0;
+	settled = LADDER[0];
 	switch (cmd->verb) {
 	case VERB_HELP:
 		fputs(cli_usage(), out);

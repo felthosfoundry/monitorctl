@@ -215,7 +215,9 @@ The profile holds no serial number and none of your current settings. `setup` sa
 
 ### When the monitor does not answer
 
-Some monitors do not answer at all. `setup` then makes three more attempts that only read the brightness, and says where the request was lost:
+Most monitors answer a single request after a 60 ms wait. Some answer with a null message, which is a valid DDC/CI reply that holds nothing, until they are given more time or the request a second time. So while no request has been answered, each retry uses another method: the request sent twice, a 250 ms wait, and both. The first method that gets an answer is used for the rest of the command, and `setup` names it in a `requests` line when it is not the usual one. A monitor that answers the usual method is never asked in any other way.
+
+Some monitors do not answer at all. `setup` then tries each method once more on the brightness, reading only, and says where the request was lost:
 
 ```text
 The monitor did not answer.
@@ -239,9 +241,10 @@ channels 1
 device SAMSUNG S34C65T firmware 41.1
 step scan
 cause not-read
-try 1 write 0x00000000 read 0xE00002D6
-try 2 write 0x00000000 read 0xE00002D6
-try 3 write 0x00000000 read 0xE00002D6
+try 1 wait 60 write 0x00000000 read 0xE00002D6
+try 2 wait 60 twice write 0x00000000 read 0xE00002D6
+try 3 wait 250 write 0x00000000 read 0xE00002D6
+try 4 wait 250 twice write 0x00000000 read 0xE00002D6
 ```
 
 | Line | What it holds |
@@ -250,8 +253,8 @@ try 3 write 0x00000000 read 0xE00002D6
 | `computer`, `system` | The Mac's model and the macOS version. |
 | `displays`, `channels` | How many external displays the Mac sees, and for how many of them macOS offers a DDC/CI channel. |
 | `device` | A Thunderbolt device plugged into the Mac: its maker, its model and its firmware. This can include a dock or a drive. |
-| `cause` | Where the request was lost: `not-sent`, `not-read`, `empty`, `invalid` or `unsteady`. |
-| `try` | One attempt: the code macOS returned for the write and for the read, and the reply's bytes when there was one. |
+| `cause` | Where the request was lost: `not-sent`, `not-read`, `empty`, `invalid`, or `null` when the monitor sent only null messages. |
+| `try` | One attempt: how long it waited for the reply, whether it sent the request twice, the code macOS returned for the write and for the read, and the reply's bytes when there was one. |
 
 The report holds no serial number, no user name, no computer name and none of your settings.
 

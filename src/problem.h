@@ -12,6 +12,8 @@ struct display_info;
 
 // One attempt to read the brightness. Each step is tried only when the one before it worked.
 struct attempt {
+	unsigned wait_ms;     // how long the attempt waited between the request and the reply
+	int twice;            // the request was sent twice before the reply was read
 	int sent;             // the request went out
 	unsigned send_status; // the operating system's code for the write, or 0 for success or unknown
 	int read;             // a reply was read
@@ -26,7 +28,7 @@ enum cause {
 	CAUSE_NOT_READ, // requests went out, and no reply could be read
 	CAUSE_EMPTY,    // replies were read, and every byte of them was zero
 	CAUSE_INVALID,  // replies had bytes in them, and none was valid DDC/CI
-	CAUSE_UNSTEADY, // an attempt got a valid answer, after earlier requests had all failed
+	CAUSE_NULL,     // the monitor replied with a null message: valid DDC/CI, and no answer in it
 };
 
 // Returns the cause, and writes to `*status` the operating system's code that goes with it, or 0.
